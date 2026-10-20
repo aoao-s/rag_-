@@ -1,4 +1,4 @@
-﻿# rag_system（PR3）运行手册：切分 · 入库 · 检索
+# rag_system（PR3）运行手册：切分 · 入库 · 检索
 
 知识库链路：**文件 → 加载 → 父/子块切分 → BGE-M3 稠密+稀疏 → Milvus → 混合检索 → 重排 → 证据门**。
 与 qa_system 的分工：FAQ 答"标准问法"，rag_system 答"要读材料才能答的问题"，两者由编排层按意图分流。
@@ -61,6 +61,11 @@ F:\miniconda3\envs\ragpro\python.exe -m pytest
 F:\miniconda3\envs\ragpro\python.exe -m rag_system.ingest --defaults
 F:\miniconda3\envs\ragpro\python.exe main.py
 ```
+
+`ragpro` 里的版本比上表（`requirements-rag.txt` 那套）更新：torch **2.14.1+cpu**、transformers **5.19.0**、
+pymilvus **3.0.2**、sentencepiece 0.2.2、FlagEmbedding 1.3.x。这套组合已实测可用（101 条单测、622 块入库、
+检索接口 200），**不要**再按上表降版本；上表只适用于新建干净 venv，按它装会遇到 sentencepiece 0.2.2 崩溃、
+pymilvus 缺 `pkg_resources`、hub/datasets 版本互斥等旧坑。
 
 
 模型权重放本地（默认指向旧项目目录，可用 `RAG_EMBED_MODEL_PATH` / `RAG_RERANKER_PATH` 指到别处）：
