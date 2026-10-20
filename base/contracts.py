@@ -7,8 +7,17 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:  # Python 3.10（edu_rag 环境）没有 StrEnum，这里补一个等价实现
+
+    class StrEnum(str, Enum):  # type: ignore[no-redef]
+        def __str__(self) -> str:
+            return str(self.value)
 
 
 class Strategy(StrEnum):

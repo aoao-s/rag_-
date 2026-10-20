@@ -88,8 +88,14 @@ class Settings(BaseSettings):
     rag_child_overlap: int = Field(default=20, alias="RAG_CHILD_OVERLAP")
     # 单篇文档最多产出多少子块，防止一份几百页的 PDF 把库撑爆
     rag_max_chunks_per_doc: int = Field(default=2000, alias="RAG_MAX_CHUNKS_PER_DOC")
+    # PDF 解析器：auto=有 MINERU_TOKEN 走云解析、失败自动退本地；mineru=只用云；local=只用 PyMuPDF
+    rag_pdf_parser: str = Field(default="auto", alias="RAG_PDF_PARSER")
+    # Office/图片里的内嵌图是否 OCR：慢且贵，默认关闭（教材 PDF 走 MinerU 自带版面解析）
+    rag_ocr_images: bool = Field(default=False, alias="RAG_OCR_IMAGES")
 
     # ---- 在线检索与重排 ----
+    # 关闭后 /v1/rag/* 直接 503，编排层只走 FAQ（本地没有 Milvus 时用）
+    rag_enabled: bool = Field(default=True, alias="RAG_ENABLED")
     # 每路 ANN 召回条数：融合后按父块去重，实际留存的父块远少于这个数
     rag_top_k: int = Field(default=40, alias="RAG_TOP_K")
     # 最终进 prompt 的父块数（证据条数）

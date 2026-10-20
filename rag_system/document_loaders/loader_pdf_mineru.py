@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import time
 import zipfile
 from pathlib import Path
@@ -24,6 +25,22 @@ import httpx
 from rag_system.document_loaders.base import BaseDocumentLoader, LoadedDoc, LoaderError, guess_subject
 
 _SUBJECTS = ("语文", "数学", "英语", "物理", "化学", "生物", "历史", "地理", "政治")
+
+_IMAGE_MD = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_IMAGE_HTML = re.compile(r"<img\b[^>]*/?>", re.IGNORECASE)
+
+
+def strip_images(markdown: str) -> str:
+    """去掉图片引用。
+
+    MinerU 的图片链接是 `images/<64 位哈希>.jpg`，直接进切分会把哈希串当正文词，
+    既占 token 又把 BM25/向量带偏；图片本身对"查知识点"没有检索价值
+    （需要看图时由前端按 page 定位原 PDF）。表格 HTML 与 LaTeX 公式**保留**。
+    """
+    text = _IMAGE_MD.sub("", markdown)
+    text = _IMAGE_HTML.sub("", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def content_hash(path: Path) -> str:
@@ -54,7 +71,7 @@ class MinerUClient:
         self._token = token
         self._base = base.rstrip("/")
         self._model = model
-        self._poll = max(1, poll_interval)
+        self._poll_interval = max(1, poll_interval)
         self._timeout = timeout_s
         self._cache_dir = cache_dir
         self._http = httpx.Client(timeout=http_timeout)
@@ -115,7 +132,7 @@ class MinerUClient:
                 return items
             if time.time() > deadline:
                 raise LoaderError(f"MinerU 轮询超时（{self._timeout}s）：batch={batch_id}")
-            time.sleep(self._poll)
+            time.sleep(self._poll_interval)
 
     def _unpack(self, zip_bytes: bytes, digest: str) -> tuple[str, int, int]:
         """解压并返回 (markdown, 页数, 图片数)。
@@ -178,6 +195,7 @@ class PdfLoader(BaseDocumentLoader):
     def load(self, path: str | Path) -> LoadedDoc:
         p = Path(path).resolve()
         markdown, meta = self._client.parse(p)
+        markdown = strip_images(markdown)
         if not markdown.strip():
             raise LoaderError(f"MinerU 返回空正文：{p}")
         return LoadedDoc(

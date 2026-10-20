@@ -19,10 +19,39 @@ datasets/08_subtitles ...srt
 
 ```powershell
 cd F:\heima\RAG\RAGpro_智能教育系统
-.\.venv\Scripts\python.exe -m pip install -r requirements-rag.txt
-# torch 按显卡驱动单独装（cu121 与 CUDA 12.x 驱动配套）。CPU 版可先跑通链路，但线上不可用。
-.\.venv\Scripts\python.exe -m pip install torch==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+# torch 单独装（体积 200MB+，按驱动选）：
+#   GPU：.\.venv\Scripts\python.exe -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+#   CPU：.\.venv\Scripts\python.exe -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
 ```
+
+**这台机器的实测版本组合（已在 CPU 上跑通端到端，不要随手升级）**：
+
+| 包 | 版本 | 为什么卡这个版本 |
+|---|---|---|
+| torch | 2.5.1 (CPU wheel) | 本机无可用 CUDA 运行时；cu121 版换卡后直接替换即可 |
+| transformers | 4.44.2 | FlagEmbedding 1.3.2 的适配上限，4.5x 会因 `sentencepiece` 导入链报错 |
+| sentencepiece | **0.2.0** | 0.2.2 的 cp312 wheel 在 Windows 上 import 即 0xC0000005 崩溃 |
+| datasets | **2.21.0** | 与 `huggingface-hub 0.36.2` 配套；5.x 要求 hub≥1.31，与 transformers 4.44 冲突 |
+| huggingface-hub | 0.36.2 | transformers 4.44 要求 `<1.0` |
+| peft | 0.12.0 | FlagEmbedding 的重排器在 import 期就会 `from peft import PeftModel` |
+| pymilvus | 2.4.9 | 与服务端 Milvus 2.4.0 对齐；依赖 `setuptools<81`（`pkg_resources` 被移除会直接崩） |
+| marshmallow | 3.22.0 | pymilvus 2.4.9 未声明该可选依赖，缺了会 `ImportError` |
+
+两个**必踩的坑**：
+
+1. 仓库根有 `datasets/` 目录（项目方语料），Python 会把它当 namespace 包，`import datasets` 拿到的是目录而不是 HF 库 → 装了 `datasets` 包后由 site-packages 的正规包胜出，别删这个目录即可。
+2. 下载 torch 走公网很慢时用 `scripts/fetch_torch.ps1`（分段 curl + 断点重试 + 拼装校验），`scripts/fetch_wheel.py` 是备用下载器。
+
+### 1.1 换用 conda 环境 `edu_rag`
+
+项目当前（2026-10-20 起）跑在 `F:\miniconda3\envs\edu_rag`（Python 3.10）上：torch 2.10 / transformers 4.45 / pymilvus 2.6.4 / FlagEmbedding 1.3.5 都已在里面，**不需要**再装 RAG 那几个大包。缺的是这 5 个：
+
+```powershell
+F:\miniconda3\envs\edu_rag\python.exe -m pip install pymupdf structlog prometheus-client DBUtils pytest
+```
+
+`python-docx` / `python-pptx` / `rapidocr-onnxruntime` 该环境已有，不用重装。
 
 模型权重放本地（默认指向旧项目目录，可用 `RAG_EMBED_MODEL_PATH` / `RAG_RERANKER_PATH` 指到别处）：
 
@@ -59,6 +88,33 @@ cd F:\heima\RAG\RAGpro_智能教育系统
 - **单文件失败不中断**：失败进 `data/ingest_manifest.json` 的 `failures`，退出码为 1。
 - **PDF**：`loader_pdf_mineru.py` 走 MinerU 云解析，结果缓存在 `data/mineru/`，同一份 PDF 只花一次额度（`MINERU_TOKEN`）。
 
+### 3.1 支持哪些文件、用哪个解析器
+
+| 后缀 | 加载器 | 说明 |
+|---|---|---|
+| `.md` `.markdown` `.txt` | `loader_text.py` | 多编码兜底（utf-8-sig→utf-8→gbk→gb18030），解不出编码直接报错 |
+| `.srt` | `loader_text.py::SubtitleLoader` | 去时间轴与序号，只留台词；`doc_type=subtitle` |
+| `.docx` | `loader_office.py::DocxLoader` | 按文档流取块（段落/表格交错顺序不丢）；标题样式 → Markdown 标题；表格 → Markdown 表格 |
+| `.pptx` | `loader_office.py::PptxLoader` | 逐页 + 形状按 `(top, left)` 排阅读顺序；表格同样转 Markdown |
+| `.jpg` `.jpeg` `.png` `.bmp` `.webp` | `loader_image.py` | 走 OCR；OCR 不可用或识别为空 → 报错（不静默空文档） |
+| `.pdf` | `loader_pdf_mineru.py` / `loader_pdf_local.py` | 见下面的 `RAG_PDF_PARSER` |
+
+PDF 解析器选择（`.env`）：
+
+```ini
+RAG_PDF_PARSER=auto     # auto | mineru | local
+RAG_OCR_IMAGES=false    # Office/图片里的内嵌图是否 OCR
+```
+
+| 取值 | 行为 | 什么时候用 |
+|---|---|---|
+| `auto`（默认） | 有 `MINERU_TOKEN` 就先云解析；云侧任何异常自动退本地 PyMuPDF，并打 `pdf_parser_fallback`（`meta` 里留 `parser_fallback` + `mineru_error`）；没有 token 直接用本地 | 日常 |
+| `mineru` | 只用云解析，没有 token 或失败就报错 | 要保证解析质量（公式/表格/多栏） |
+| `local` | 只用 PyMuPDF：逐页抽文本 + 大图/扫描页 OCR，每页打 `<!-- page: n -->` | 断网、批量、或不想花 MinerU 额度 |
+
+两者的取舍：MinerU 出 Markdown（标题、表格、公式结构都在），质量上限高但要联网；本地路径零成本但双栏/扫描件容易串行、公式会变乱码。
+
+
 ## 4. 检索冒烟
 
 ```powershell
@@ -71,6 +127,22 @@ cd F:\heima\RAG\RAGpro_智能教育系统
 
 冒烟脚本会打印：命中父块数、top3 的分数/标题/小节/文件名、证据门结论。
 **拒答不是失败**——`below_threshold` / `ambiguous` / `single_weak_evidence` 都是设计行为。
+
+## 4.1 走服务调检索（`/v1/rag/*`）
+
+```powershell
+# 启动时会把 Milvus 句柄与向量化模型一起装好；rag 起不来时 /v1/rag/* 返回 503 + reason，FAQ 不受影响
+python main.py
+curl "http://127.0.0.1:8000/readyz"
+# {"status":"ready","faq_docs":2000,"rag":true,"rag_docs":17,"rag_reason":"ok"}
+
+curl "http://127.0.0.1:8000/v1/rag/search?q=勾股定理的证明方法&top_k=8"
+curl "http://127.0.0.1:8000/v1/rag/search?q=二次函数&subject=数学&doc_type=textbook,faq&rerank=false"
+curl "http://127.0.0.1:8000/v1/rag/stats"
+```
+
+返回体关键字段：`evidence`（证据门：`passed/reason/top_score/margin/n_docs`）、`citations`（引用卡片：`file/title/heading/page`）、`evidences`（父块正文与子块命中数）、`degraded`（如 `rerank_failed` 说明按融合分排序）。
+`rerank=false` 或环境里没有 FlagEmbedding 时不会报错，只在 `degraded` 里标明——这就是"降级不报错"的验收点。
 
 ## 5. 参数（`.env`，基线见 CLAUDE.md §6.3）
 

@@ -1,4 +1,4 @@
-# EduRAG-Pro 智能教育知识库系统
+﻿# EduRAG-Pro 智能教育知识库系统
 
 > 项目代号：EduRAG-Pro 1.41　|　形态：**交付项目**（非演示 Demo）　|　硬件：**有 GPU**　|　状态：架构设计完成，待实现
 > 本文件是本仓库的"项目宪法"：给人和给 AI 编码助手共用。改动架构决策时，**先改本文件，再改代码**。
@@ -712,9 +712,13 @@ class LLMGateway:                                  # rag_system/core/llm_gateway
 
 | 能力 | 代码位置 | 说明 |
 |---|---|---|
-| 加载分发 | `rag_system/document_loaders/thy_factory.py` | 按后缀选 loader；`.md/.txt` 多编码兜底（utf-8-sig/gbk/gb18030，乱码率 >0 直接报错而不是悄悄进库） |
-| 文本/字幕/Office | `loader_text.py`、`loader_office.py` | 字幕去时间轴与序号；front-matter 剥离 |
-| PDF | `loader_pdf_mineru.py` | MinerU 云 API，结果按文件 md5 缓存到 `data/mineru/` |
+| 加载分发 | `rag_system/document_loaders/thy_factory.py` | 按后缀选 loader；`.md/.txt` 多编码兜底（utf-8-sig/gbk/gb18030，乱码率 >0 直接报错而不是悄悄进库）；PDF 双解析器 + `_MinerUWithLocalFallback` |
+| 文本/字幕 | `loader_text.py` | 字幕去时间轴与序号；front-matter 剥离；空文件报错 |
+| Office | `loader_office.py` | `.docx/.pptx` 按文档流顺序取块（段落与表格交错、形状按 top/left）；标题样式转 Markdown 标题；表格转 Markdown 表格；内嵌图 OCR 由 `RAG_OCR_IMAGES` 控制（默认关） |
+| 图片 | `loader_image.py` | `.jpg/.png/.bmp/.webp` 走 OCR；OCR 不可用或识别为空**抛错**而不是返回空串 |
+| OCR 引擎 | `document_loaders/ocr.py` | 进程内单例，优先 `rapidocr_paddle`（GPU）、退 `rapidocr_onnxruntime`（CPU）；超大图先缩到 2000px |
+| PDF（云） | `loader_pdf_mineru.py` | MinerU 云 API，结果按内容 sha256 缓存到 `data/mineru/`；Markdown 里的图片引用入库前清掉（避免污染向量） |
+| PDF（本地） | `loader_pdf_local.py` | PyMuPDF 逐页抽取 + 大图/扫描页 OCR；每页打 `<!-- page: n -->` 供引用对齐；`split_pages()` 取页号 |
 | 学科识别 | `document_loaders/base.py::guess_subject` | 先按 `-` 分词命中，再整串子串兜底；认不出返回 None（不猜） |
 | 父/子块切分 | `rag_system/text_splitters/parent_child.py` | 父块按标题树聚合、按标点装箱；子块继承父块标题；每子块携带 `parent_text` |
 | 向量化 | `rag_system/embedding/bge_m3.py` | `BGEM3FlagModel` 一次出 dense+sparse；无 torch/无权重时退 `HashEmbedder` 并打 warning |
@@ -723,11 +727,23 @@ class LLMGateway:                                  # rag_system/core/llm_gateway
 | 在线检索 | `rag_system/core/retriever.py` | 混合召回 → 父块合并去重 → 可选重排 → `final_n`；重排失败降级为融合分并记 `degraded` |
 | 重排 | `rag_system/core/reranker.py` | `FlagReranker` 懒加载 + 单例，`normalize=True` |
 | 证据门 | `rag_system/core/evidence_gate.py` | 三条件：分数、top1-top2 间隔、证据数；孤证额外 +0.10 门槛 |
+| 检索接口 | `rag_system/api.py` | `GET /v1/rag/search`（证据 + 引用卡片 + 证据门结论）、`GET /v1/rag/stats`；未就绪 503 带 reason，不拖垮 FAQ |
+| 启动装载 | `main.py::Container.load_rag` | 启动期建 Milvus 句柄 + 装载向量化模型（GPU 15–40 s）；失败只置 `rag=false`，`/readyz` 仍 200 并暴露 `rag_reason` |
 | 冒烟脚本 | `scripts/smoke_rag.py` | `--backend hash` 验证管线；默认验证真实质量；拒答按设计行为打印 |
 
-**已验证**：hash 后端跑通「6 份教材 → 17 子块 → 写入 Milvus → 混合检索 → 证据门」，全链路 4.5 s（含建库建集合）；单测 79 条全绿（切分 7 + 入库 6 + 检索/证据门 9 + qa 57）。
+**已验证（hash）**：hash 后端跑通「6 份教材 → 17 子块 → 写入 Milvus → 混合检索 → 证据门」，全链路 4.5 s（含建库建集合）；`/v1/rag/search` 返回 evidence+citations（`{"passed":false,"reason":"below_threshold"}` 为设计行为）；单测 84 条全绿（切分 7 + 入库 6 + 检索/证据门/接口 14 + qa 57）。
 
-**未验证/未做**：真 BGE-M3 端到端（本机 torch 下载受网络限制，待权重装好后重跑 `smoke_rag.py`）；重排延迟基线；黄金集 Recall/MRR；索引版本化与 alias 切换。
+**已验证（真 BGE-M3，2026-10-20，CPU）**：
+
+- 入库：14 份文档（教材 6 + 教案 6 + 字幕 2）→ **110 个子块**，耗时 82 s（≈0.75 s/块，含 4 类解析；CPU 单进程）
+- 编码：模型装载 7.3–7.9 s；首条 4.05 s（含 warmup）；批量 8 条 0.64 s（≈80 ms/条）
+- 检索（`/v1/rag/search?q=顶点式怎么写`）：top1 **0.9794**（命中"通过配方，一般式可化为顶点式"原文），evidence `passed=true`，其余 4 条按分数递降且与主题相关；`cost_ms=11529` 为**首次请求含重排冷启动**
+- 重排开销（CPU）：40 候选 × bge-reranker-v2-m3 约 **4.5 s**；`rerank=false` 时同一查询 **599 ms**
+- 结论：**CPU 只能用于功能验证，线上必须 GPU**（手册 §1 已写清换 cu121 wheel 的方式）
+
+**未做**：黄金集 Recall/MRR 基线；索引版本化与 alias 切换；GPU 下的重排延迟基线。
+
+**加载器矩阵（第二批，2026-10-20）**：`.md/.txt/.markdown/.srt/.docx/.pptx/.pdf/.jpg/.jpeg/.png/.bmp/.webp` 全覆盖；PDF 解析器由 `RAG_PDF_PARSER=auto|mineru|local` 决定，`auto` 下云解析任何异常都退本地并打 `pdf_parser_fallback`（同时在 `meta` 里留 `parser_fallback`/`mineru_error`，不静默）；两条都失败时把两个原因一起抛。加载器单测 16 条（含 docx 标题+表格、pptx 形状顺序、本地 PDF 页标记与空 PDF、工厂分派与双失败信息）；全量 **100 passed**。
 
 ---
 
@@ -865,9 +881,8 @@ MemoryWriter.on_turn(user_id, sid, turn) -> None
 | 2026-10-20 | **离线数据面落地**：`docker/docker-compose.yml` 端口/账号全部取自 `.env`（MySQL 3307 / Redis 6380，避开旧项目占用的 3306/6379），每个服务 `pull_policy: never`；`docker/offline/{save,load}.ps1` 导出/导入镜像（mysql 237 MB + redis 55 MB）；`scripts/{docker_up,docker_down}.ps1` 封装 `--env-file` 与健康等待；文档 `docs/docker-离线部署.md`。实测 MySQL 8.0.46 + Redis 健康，2000 条 FAQ 入库 | 项目组 |
 | 2026-10-20 | **全局日志 + FAQ 二级缓存**：`base/logger.py` 改为 stdout + `logs/app.log`（50 MB×10 轮转），structlog 经 `stdlib.LoggerFactory` 与 uvicorn 日志共用 handler（修掉"配了 logger 但文件为空"）；`qa_system/res/qa_cache.py` 新增 Redis 正/负缓存、绝对寿命、命中续命、`SingleFlight`；缓存 key 加 `edurag:{env}` 前缀；补 `LOG_*` / `FAQ_CACHE_*` 环境变量；57 条单测全绿 | 项目组 |
 | 2026-10-20 | **日志改为人读行格式**：`base/log_messages.py` 事件→中文文案表；行格式 `时间.毫秒 [级别] [pid:线程] logger (文件:行): 文案`（与旧项目 Ragpro 对齐）；检索结果单行带 `[来源: Redis 缓存 / MySQL 索引]`，未命中补一行「转交 RAG 检索」；分 `LOG_LEVEL`（控制台）/`LOG_FILE_LEVEL`（文件）；`LOG_QUERY_TEXT` dev 置 `true` | 项目组 |
-
-
-
-
-
 | 2026-10-20 | **PR3 第一批（切分/入库/检索）**：`rag_system/` 新增 document_loaders（md/txt/docx/pptx/srt/pdf-MinerU）、text_splitters（父 1200/子 300 + 标题继承）、embedding（BGE-M3 稠密+稀疏，无 torch 时退 hash）、store（Milvus HNSW+稀疏倒排、hybrid_search、先删后写）、ingest（CLI + 流水线 + manifest）、core（retriever 父块合并去重/可选重排/证据门）；`scripts/smoke_rag.py` 冒烟；79 条单测全绿；hash 后端跑通 6 份教材 → 17 子块 → 检索全链路 | 项目组 |
+| 2026-10-20 | **PR3 第二批（检索接入服务）**：新增 `rag_system/api.py` 的 `/v1/rag/search`、`/v1/rag/stats`；`main.py` 启动期 `Container.load_rag()` 预加载 Milvus 句柄与向量化模型，失败只置 `rag=false`、`/readyz` 暴露 `rag/rag_docs/rag_reason`、`/metrics` 增 `edurag_rag_ready`/`edurag_rag_docs`；新增 `tests/test_rag_api.py` 5 条；单测 84 条全绿 | 项目组 |
+| 2026-10-20 | **PR3 真 BGE-M3 端到端跑通（CPU）**：离线分段拼装 torch 2.5.1+cpu；锁定 transformers 4.44.2 / sentencepiece **0.2.0**（0.2.2 在 Windows cp312 上 import 即崩）/ datasets 2.21.0 / huggingface-hub 0.36.2 / peft 0.12.0 / pymilvus 2.4.9 + `setuptools<81` + `marshmallow 3.22`；14 份文档 → 110 子块入库 82 s；`/v1/rag/search` top1 0.9794 命中原文、evidence 通过；实测重排 40 候选 CPU 约 4.5 s（`rerank=false` 599 ms）；`requirements.txt` 补 RAG 段、`.gitignore` 忽略 `rag_system/models/` | 项目组 |
+| 2026-10-20 | **PR3 第三种：加载器矩阵补齐**（参考旧项目 `Ragpro/rag_system/document_loaders`）：新增 `ocr.py`（rapidocr 进程内单例，paddle 优先、onnxruntime 兜底）、`loader_office.py`（docx/pptx 按文档流顺序、标题样式转 Markdown、表格转 Markdown 表格、内嵌图 OCR 可选）、`loader_image.py`（图片 OCR，失败抛错不返回空串）、`loader_pdf_local.py`（PyMuPDF 逐页 + 大图/扫描页 OCR + `<!-- page: n -->` 页标记）；工厂支持 12 种后缀，PDF 增 `RAG_PDF_PARSER=auto|mineru|local` 与云→本地自动降级（打 `pdf_parser_fallback`、meta 留痕）；新增 16 条加载器单测，全量 100 passed | 项目组 |
+

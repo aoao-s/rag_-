@@ -24,6 +24,9 @@ from base.config import Settings, get_settings
 from base.db import MySQL
 from base.logger import bind, clear, configure, get_logger, new_request_id
 from qa_system.api import router as faq_router
+from rag_system.api import router as rag_router
+from rag_system.core.evidence_gate import evaluate as gate_evaluate
+from rag_system.core.retriever import Retriever
 from qa_system.res.qa_cache import (
     BaseFAQCache,
     InMemoryFAQCache,
@@ -53,6 +56,7 @@ class Container:
         self.faq_cache: BaseFAQCache | None = None
         self.faq_repository: FAQRepository | None = None
         self.faq_service: FAQService | None = None
+        self.rag: dict[str, Any] | None = None
         self.degraded = False
 
     def build(self) -> None:
@@ -144,7 +148,59 @@ class Container:
         self.faq_service = service
         log.info("faq_ready", degraded=self.degraded, **info)
 
+    async def load_rag(self) -> None:
+        """启动期装载检索链：模型 + Milvus 句柄一次建好，请求路径零加载。
+
+        RAG 起不来不应该拖垮 FAQ（两者是独立入口），所以这里失败只标记 not ready：
+        `/v1/rag/*` 返回 503 并带上原因，FAQ 照常服务。
+        """
+        s = self.settings
+        if not s.rag_enabled:
+            self.rag = {"ready": False, "reason": "disabled"}
+            log.info("rag_disabled")
+            return
+
+        import asyncio
+
+        try:
+            retriever = Retriever(s)
+            # 建索引句柄 + 装载向量化模型都在这里完成（GPU 上约 15–40 s，CPU 更久）
+            store = await asyncio.to_thread(lambda: retriever.store)
+            docs = await asyncio.to_thread(store.count)
+            embedder = await asyncio.to_thread(lambda: retriever.embedder)
+            self.rag = {
+                "ready": True,
+                "reason": "ok",
+                "retriever": retriever,
+                "gate": lambda result: gate_evaluate(
+                    result,
+                    threshold=s.rag_evidence_threshold,
+                    margin=s.rag_evidence_margin,
+                    min_docs=s.rag_evidence_min_docs,
+                ),
+                "embedder_name": getattr(embedder, "name", "unknown"),
+                "rerank_enabled": s.rag_rerank_enabled,
+                "docs": docs,
+            }
+            log.info(
+                "rag_ready",
+                docs=docs,
+                embedder=getattr(embedder, "name", "unknown"),
+                rerank=s.rag_rerank_enabled,
+                collection=s.milvus_collection,
+            )
+        except Exception as exc:  # noqa: BLE001 - Milvus/模型不可用时降级为"仅 FAQ"
+            self.rag = {"ready": False, "reason": str(exc)[:200]}
+            log.error("rag_unavailable", error=str(exc))
+            if not s.allow_degraded_start:
+                raise
+
     def close(self) -> None:
+        if self.rag and self.rag.get("ready"):
+            try:
+                self.rag["retriever"].store.close()
+            except Exception:  # noqa: S110 - 关闭失败不影响退出
+                pass
         if self.redis is not None:
             try:
                 self.redis.close()
@@ -188,9 +244,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     container = Container(settings)
     container.build()
     await container.load_faq()
+    await container.load_rag()
 
     app.state.container = container
     app.state.faq_service = container.faq_service
+    app.state.rag = container.rag
     app.state.ready = True
     log.info("app_ready", version=settings.app_version, env=settings.app_env)
     try:
@@ -208,6 +266,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(faq_router)
+app.include_router(rag_router)
 
 
 @app.middleware("http")
@@ -244,6 +303,9 @@ async def readyz(request: Request) -> Response:
         "status": "ready" if ready else "not_ready",
         "degraded": bool(container.degraded) if container else True,
         "faq_docs": container.faq_service.state()["docs"] if container and container.faq_service else 0,
+        "rag": bool(container.rag and container.rag.get("ready")) if container else False,
+        "rag_docs": (container.rag or {}).get("docs", 0) if container else 0,
+        "rag_reason": (container.rag or {}).get("reason") if container else "startup",
     }
     return JSONResponse(status_code=200 if ready else 503, content=body)
 
@@ -284,6 +346,16 @@ async def metrics(request: Request) -> Response:
             "# HELP edurag_faq_cache_errors_total 缓存异常数（fail-open）",
             "# TYPE edurag_faq_cache_errors_total counter",
             f"edurag_faq_cache_errors_total {stats['cache_errors']}",
+        ]
+    rag = container.rag if container else None
+    if rag is not None:
+        lines += [
+            "# HELP edurag_rag_ready 检索链是否就绪（0/1）",
+            "# TYPE edurag_rag_ready gauge",
+            f"edurag_rag_ready {1 if rag.get('ready') else 0}",
+            "# HELP edurag_rag_docs 向量库子块数",
+            "# TYPE edurag_rag_docs gauge",
+            f"edurag_rag_docs {rag.get('docs', 0)}",
         ]
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
