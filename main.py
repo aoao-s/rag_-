@@ -24,7 +24,12 @@ from base.config import Settings, get_settings
 from base.db import MySQL
 from base.logger import bind, clear, configure, get_logger, new_request_id
 from qa_system.api import router as faq_router
-from qa_system.res.qa_cache import create_redis
+from qa_system.res.qa_cache import (
+    BaseFAQCache,
+    InMemoryFAQCache,
+    RedisFAQCache,
+    create_redis,
+)
 from qa_system.res.qa_csv import load_csv_records
 from qa_system.res.qa_db import (
     FAQRepository,
@@ -45,6 +50,7 @@ class Container:
         self.settings = settings
         self.mysql: MySQL | None = None
         self.redis: Any = None
+        self.faq_cache: BaseFAQCache | None = None
         self.faq_repository: FAQRepository | None = None
         self.faq_service: FAQService | None = None
         self.degraded = False
@@ -54,9 +60,48 @@ class Container:
         self.mysql = MySQL(s)
         try:
             self.redis = create_redis(s)
+            self.redis.ping()  # 早失败：省得等到第一个请求才在日志里发现连不上
+            log.info("redis_ready", host=s.redis_host, port=s.redis_port, db=s.redis_db)
         except Exception as exc:  # Redis 只用于缓存/限流，不可用时降级而不是拒服务
             log.warning("redis_unavailable", error=str(exc))
             self.redis = None
+
+        if s.faq_cache_enabled and self.redis is not None:
+            self.faq_cache = RedisFAQCache(
+                self.redis,
+                max_ttl=s.faq_cache_max_ttl,
+                slide_ratio=s.faq_cache_slide_ratio,
+            )
+            log.info(
+                "faq_cache_ready",
+                ttl=s.faq_cache_ttl,
+                max_ttl=s.faq_cache_max_ttl,
+                negative_ttl=s.faq_cache_negative_ttl,
+                slide_ratio=s.faq_cache_slide_ratio,
+            )
+        elif s.faq_cache_enabled:
+            # Redis 不可用时退化为进程内缓存：单副本仍有收益，多副本各自为政但结果一致
+            # （命中内容由语料版本决定，不依赖副本间同步）
+            self.faq_cache = InMemoryFAQCache(max_ttl=s.faq_cache_max_ttl)
+            log.warning("faq_cache_disabled", reason="redis_unavailable", fallback="in_memory")
+        else:
+            log.info("faq_cache_disabled", reason="config")
+
+    def _make_service(self, repository: FAQRepository) -> FAQService:
+        """FAQService 的唯一构造点：缓存、策略、日志开关只在这里接线。"""
+        s = self.settings
+        return FAQService(
+            repository,
+            policy=_policy_from(s),
+            alias_enabled=s.faq_alias_enabled,
+            top_k=s.faq_top_k,
+            extra_words=s.subjects,
+            cache=self.faq_cache,
+            cache_ttl=s.faq_cache_ttl,
+            cache_negative_ttl=s.faq_cache_negative_ttl,
+            cache_prefix=f"edurag:{s.app_env}",
+            log_query=s.log_query_text,
+        )
 
     async def load_faq(self) -> None:
         s = self.settings
@@ -71,13 +116,7 @@ class Container:
                 csv_path = Path(__file__).resolve().parent / csv_path
             records = load_csv_records(csv_path)
             repository: FAQRepository = InMemoryFAQRepository(records)
-            service = FAQService(
-                repository,
-                policy=_policy_from(s),
-                alias_enabled=s.faq_alias_enabled,
-                top_k=s.faq_top_k,
-                extra_words=s.subjects,
-            )
+            service = self._make_service(repository)
             info = await service.load()
             await service.warmup()
             self.faq_repository = repository
@@ -88,13 +127,7 @@ class Container:
 
         assert self.mysql is not None
         repository = MySQLFAQRepository(self.mysql)
-        service = FAQService(
-            repository,
-            policy=_policy_from(self.settings),
-            alias_enabled=self.settings.faq_alias_enabled,
-            top_k=self.settings.faq_top_k,
-            extra_words=self.settings.subjects,
-        )
+        service = self._make_service(repository)
         try:
             info = await service.load()
         except Exception as exc:
@@ -104,13 +137,7 @@ class Container:
             log.error("faq_load_failed_degraded", error=str(exc))
             self.degraded = True
             repository = InMemoryFAQRepository()
-            service = FAQService(
-                repository,
-                policy=_policy_from(self.settings),
-                alias_enabled=self.settings.faq_alias_enabled,
-                top_k=self.settings.faq_top_k,
-                extra_words=self.settings.subjects,
-            )
+            service = self._make_service(repository)
             info = await service.load()
         await service.warmup()
         self.faq_repository = repository
@@ -141,7 +168,14 @@ def _policy_from(settings: Settings):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
-    configure(settings.log_level)
+    # 日志必须在任何业务初始化之前配好，否则启动期的失败会掉进 stdout 之外的虚空
+    configure(
+        settings.log_level,
+        log_path=settings.log_path,
+        max_bytes=settings.log_max_bytes,
+        backup_count=settings.log_backup_count,
+    )
+    bind(node="startup", env=settings.app_env, version=settings.app_version)
 
     problems = settings.self_check()
     if problems:
@@ -237,6 +271,18 @@ async def metrics(request: Request) -> Response:
             "# HELP edurag_faq_latency_ms_avg 平均延迟(ms)",
             "# TYPE edurag_faq_latency_ms_avg gauge",
             f"edurag_faq_latency_ms_avg {stats['avg_latency_ms']}",
+            "# HELP edurag_faq_cache_hits_total 缓存命中数",
+            "# TYPE edurag_faq_cache_hits_total counter",
+            f"edurag_faq_cache_hits_total {stats['cache_hits']}",
+            "# HELP edurag_faq_cache_fills_total 缓存回填数",
+            "# TYPE edurag_faq_cache_fills_total counter",
+            f"edurag_faq_cache_fills_total {stats['cache_fills']}",
+            "# HELP edurag_faq_cache_hit_rate 缓存命中率",
+            "# TYPE edurag_faq_cache_hit_rate gauge",
+            f"edurag_faq_cache_hit_rate {stats['cache_hit_rate']}",
+            "# HELP edurag_faq_cache_errors_total 缓存异常数（fail-open）",
+            "# TYPE edurag_faq_cache_errors_total counter",
+            f"edurag_faq_cache_errors_total {stats['cache_errors']}",
         ]
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
@@ -251,6 +297,9 @@ def run() -> None:
         host=settings.http_host,
         port=settings.http_port,
         log_level=settings.log_level.lower(),
+        # log_config=None：否则 uvicorn 会用自己的 handler 覆盖 root，
+        # 启动信息与访问日志就进不了 logs/app.log（排查启动失败时最需要的那几行）
+        log_config=None,
     )
 
 

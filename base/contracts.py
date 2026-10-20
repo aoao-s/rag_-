@@ -54,6 +54,10 @@ class FAQHit:
     candidates: tuple[FAQCandidate, ...] = ()
     reason: str = ""
     latency_ms: float = 0.0
+    # 命中来自哪一层：cache（Redis/进程内）、index（BM25/精确哈希）、none。
+    # 调用方（以及排障的人）需要它来区分"服务慢"与"缓存没生效"。
+    source: str = "index"
+    cache: str = ""
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -66,6 +70,8 @@ class FAQHit:
             "alias_hit": self.alias_hit,
             "reason": self.reason,
             "latency_ms": round(self.latency_ms, 2),
+            "source": self.source,
+            "cache": self.cache,
             "candidates": [
                 {"faq_id": c.faq_id, "question": c.question, "score": round(c.score, 4)}
                 for c in self.candidates

@@ -89,7 +89,52 @@ curl "http://127.0.0.1:8124/metrics"
 | POST | `/v1/faq/rebuild` | 手动重建 |
 | GET | `/healthz` `/readyz` `/metrics` | 存活 / 就绪 / Prometheus |
 
-## 6. 已知待办
+## 6. 日志与缓存（2026-10-20 新增）
+
+### 6.1 日志去哪了
+
+- 启动后 `logs/app.log` 会持续写入 JSON 行（`RotatingFileHandler`，50 MB 一份、保留 10 份）。
+  同时 stdout 也有一份（容器里 `docker logs` 能看到同样的行）。
+- 业务日志与 uvicorn 访问日志走同一套 handler，所以"有请求没日志"不会再出现。
+- 常见事件名：
+
+| event | 含义 | 关键字段 |
+| --- | --- | --- |
+| `faq_search` | 每次查询的结论 | `source`(index/cache)、`cache`(hit/miss)、`reason`、`score`、`candidates`、`latency_ms` |
+| `faq_db_query` | 读 MySQL | `op`(fetch_published/fetch_aliases)、`rows`、`cost_ms` |
+| `faq_cache_fill` / `faq_cache_slide` / `faq_cache_stale` | 回填 / 续命 / 缓存指向已下线条目 | `ttl`、`remaining_s` |
+| `faq_cache_error` | 缓存读写异常（fail-open，不影响回答） | `op`、`error` |
+| `http_request` | 接入层请求 | `request_id`、`path`、`status`、`latency_ms` |
+
+排查一条查询的完整链路：
+
+```powershell
+# 按指纹找一次查询（默认不记原文，只记 q_hash 与 q_len）
+Select-String -Path logs\app.log -Pattern '"event": "faq_search"' | Select-Object -Last 5
+# 临时要看原文再开（默认关闭，避免学生隐私落盘）
+# .env: LOG_QUERY_TEXT=true
+```
+
+### 6.2 Redis 二级缓存
+
+```powershell
+# 看有哪些热数据
+docker exec edurag-redis redis-cli -a 1234 --no-auth-warning --scan --pattern 'edurag:*'
+# 单条内容与剩余寿命
+docker exec edurag-redis redis-cli -a 1234 --no-auth-warning get  "edurag:dev:faq:v1:*:<hash>"
+docker exec edurag-redis redis-cli -a 1234 --no-auth-warning ttl  "edurag:dev:faq:v1:*:<hash>"
+# 想清空热数据（安全：缓存内容可由 MySQL 重算）
+docker exec edurag-redis redis-cli -a 1234 --no-auth-warning flushdb
+```
+
+规则：
+
+- key 带语料版本 `v{n}`；发布/下线后版本 +1，旧 key 自然失效，不需要遍历删除。
+- 正缓存 1 h、绝对寿命 6 h；命中时剩余 ≤50% 才 `EXPIRE` 续命（避免每次命中都写 Redis）。
+- 负缓存 30 s，**带 top3 候选**（交棒 RAG 要用）。
+- Redis 挂了不影响回答：直接走内存索引，指标 `edurag_faq_cache_errors_total` 会涨。
+
+## 7. 已知待办
 
 - `FAQ_THRESHOLD=0.25` / `FAQ_MARGIN=0.10` 已用 480 条合成同义问法 + 80 条题库负样本标定
   （`docs/analysis/faq_threshold_report.md`，precision 0.950 / recall 0.637）。
@@ -98,7 +143,7 @@ curl "http://127.0.0.1:8124/metrics"
 - 别名表目前只做「整串等价」（`faq_alias`），子串替换会产生"学费学费多少"这类脏串，已明确不做。
 - 语料 >5 万条时把全量重建换成文档级增量（现在 160 条约 50 ms，不值得提前优化）。
 
-## 7. 阈值标定（可复跑，不需要数据库）
+## 8. 阈值标定（可复跑，不需要数据库）
 
 ```bash
 # 1) 生成同义问法（deepseek-flash，160 条 FAQ × 3 变体，断点续跑）

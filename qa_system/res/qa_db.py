@@ -1,4 +1,4 @@
-﻿"""FAQ 持久化：MySQL 实现 + 内存实现（测试 / 无库演示）。
+"""FAQ 持久化：MySQL 实现 + 内存实现（测试 / 无库演示）。
 
 为什么用 Protocol 而不是基类：qa_system 只依赖"能取到 published 语料"这一契约，
 MySQL、内存、未来的 ES/CSV 都能替换，且测试不需要起数据库。
@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from base.labels import normalize_subject
+from base.logger import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,10 +106,32 @@ class MySQLFAQRepository:
     def __init__(self, mysql: Any) -> None:
         self._db = mysql
 
+    def _query(self, op: str, sql: str, params: tuple[Any, ...] | None = None) -> list[dict[str, Any]]:
+        """统一出口：所有 MySQL 访问都带 op/rows/cost 日志。
+
+        没有这行日志时，"命中来自 MySQL 还是缓存"在故障复盘里只能靠猜；
+        慢查询（例如 faq 表无索引时的 LIKE）也只能看到接口变慢、看不到慢在哪。
+        """
+        started = time.perf_counter()
+        try:
+            rows = self._db.query(sql, params)
+        except Exception as exc:
+            log.error(
+                "faq_db_query_failed",
+                op=op,
+                cost_ms=round((time.perf_counter() - started) * 1000, 1),
+                error=str(exc),
+            )
+            raise
+        cost_ms = (time.perf_counter() - started) * 1000
+        log.info("faq_db_query", op=op, rows=len(rows), cost_ms=round(cost_ms, 1))
+        return rows
+
     async def fetch_published(self) -> list[FAQRecord]:
-        rows = self._db.query(
+        rows = self._query(
+            "fetch_published",
             "SELECT id, subject_name, question, answer, status, content_hash "
-            "FROM faq WHERE status = 'published' ORDER BY id"
+            "FROM faq WHERE status = 'published' ORDER BY id",
         )
         return [
             FAQRecord(
@@ -120,14 +146,16 @@ class MySQLFAQRepository:
         ]
 
     async def fetch_aliases(self) -> list[tuple[int, str]]:
-        rows = self._db.query(
+        rows = self._query(
+            "fetch_aliases",
             "SELECT a.faq_id, a.alias FROM faq_alias a JOIN faq f ON f.id = a.faq_id "
-            "WHERE f.status = 'published'"
+            "WHERE f.status = 'published'",
         )
         return [(int(row["faq_id"]), row["alias"]) for row in rows]
 
     async def fetch_by_id(self, faq_id: int) -> FAQRecord | None:
-        rows = self._db.query(
+        rows = self._query(
+            "fetch_by_id",
             "SELECT id, subject_name, question, answer, status, content_hash FROM faq WHERE id = %s",
             (faq_id,),
         )
@@ -148,6 +176,7 @@ class MySQLFAQRepository:
             "UPDATE faq SET status = 'deprecated', updated_at = NOW(), updated_by = %s WHERE id = %s",
             (operator, faq_id),
         )
+        log.info("faq_db_deprecate", faq_id=faq_id, operator=operator, affected=affected)
         return affected > 0
 
     async def publish(self, faq_id: int, operator: str) -> bool:
@@ -156,5 +185,6 @@ class MySQLFAQRepository:
             "WHERE id = %s AND status IN ('draft', 'pending', 'deprecated')",
             (operator, faq_id),
         )
+        log.info("faq_db_publish", faq_id=faq_id, operator=operator, affected=affected)
         return affected > 0
 

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import string
 import unicodedata
@@ -50,6 +51,8 @@ _COLLOQUIAL = (
 try:  # pragma: no cover - 取决于环境是否装 jieba
     import jieba
 
+    # jieba 默认把自己挂在 DEBUG 并打印"Building prefix dict…"，会把启动日志刷满
+    jieba.setLogLevel(logging.WARNING)
     _HAS_JIEBA = True
 except Exception:  # pragma: no cover
     _HAS_JIEBA = False

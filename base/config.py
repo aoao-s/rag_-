@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     http_host: str = Field(default="127.0.0.1", alias="HTTP_HOST")
     http_port: int = Field(default=8000, alias="HTTP_PORT")
 
+    # ---- 日志（落盘 + 轮转，见 CLAUDE.md §5.2）----
+    log_dir: str = Field(default="logs", alias="LOG_DIR")
+    log_file: str = Field(default="app.log", alias="LOG_FILE")
+    log_max_bytes: int = Field(default=50 * 1024 * 1024, alias="LOG_MAX_BYTES")
+    log_backup_count: int = Field(default=10, alias="LOG_BACKUP_COUNT")
+    # 是否在日志里打原始 query。生产建议 false：query 可能含学生隐私（姓名/手机号）
+    log_query_text: bool = Field(default=False, alias="LOG_QUERY_TEXT")
+
     # ---- MySQL ----
     mysql_host: str = Field(default="127.0.0.1", alias="MYSQL_HOST")
     mysql_port: int = Field(default=3306, alias="MYSQL_PORT")
@@ -64,6 +72,21 @@ class Settings(BaseSettings):
     # ---- 启动行为 ----
     # dev 下允许数据库不可用时以"空 FAQ 语料"启动，便于纯本地跑通链路；生产必须关闭
     allow_degraded_start: bool = Field(default=True, alias="ALLOW_DEGRADED_START")
+
+    # ---- FAQ 二级缓存（Redis，见 CLAUDE.md §7.1.2）----
+    faq_cache_enabled: bool = Field(default=True, alias="FAQ_CACHE_ENABLED")
+    # 命中后写入 Redis 的热数据存活时间（滑动续命），单位秒
+    faq_cache_ttl: int = Field(default=3600, alias="FAQ_CACHE_TTL")
+    # 单条热数据的绝对寿命上限：滑动续命不能无限延长，否则改了答案也换不掉
+    faq_cache_max_ttl: int = Field(default=6 * 3600, alias="FAQ_CACHE_MAX_TTL")
+    # 剩余寿命低于该比例时才续命，避免每次命中都写一次 Redis
+    faq_cache_slide_ratio: float = Field(default=0.5, alias="FAQ_CACHE_SLIDE_RATIO")
+    # 未命中的短缓存：挡住热门脏查询的重复打分，版本变更即失效
+    faq_cache_negative_ttl: int = Field(default=30, alias="FAQ_CACHE_NEGATIVE_TTL")
+
+    @property
+    def log_path(self) -> Path:
+        return BASE_DIR / self.log_dir / self.log_file
 
     @property
     def intent_labels(self) -> tuple[str, ...]:
