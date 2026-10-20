@@ -117,7 +117,7 @@ class MySQLFAQRepository:
             rows = self._db.query(sql, params)
         except Exception as exc:
             log.error(
-                "faq_db_query_failed",
+                "faq_db_failed",
                 op=op,
                 cost_ms=round((time.perf_counter() - started) * 1000, 1),
                 error=str(exc),

@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     app_env: str = Field(default="dev", alias="APP_ENV")
     app_version: str = Field(default="0.1.0", alias="APP_VERSION")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    # 文件比控制台更详细：控制台看结论（INFO），文件留现场（DEBUG：缓存 key/SQL/续命）
+    log_file_level: str = Field(default="DEBUG", alias="LOG_FILE_LEVEL")
     http_host: str = Field(default="127.0.0.1", alias="HTTP_HOST")
     http_port: int = Field(default=8000, alias="HTTP_PORT")
 

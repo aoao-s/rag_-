@@ -174,6 +174,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log_path=settings.log_path,
         max_bytes=settings.log_max_bytes,
         backup_count=settings.log_backup_count,
+        file_level=settings.log_file_level,
     )
     bind(node="startup", env=settings.app_env, version=settings.app_version)
 

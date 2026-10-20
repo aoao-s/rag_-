@@ -32,6 +32,9 @@ from qa_system.res.qa_db import FAQRecord, FAQRepository
 
 log = get_logger(__name__)
 
+# 命中来源的中文说法：日志一行内必须能直接看出"这次是缓存、索引还是 RAG"
+_SOURCE_CN = {"cache": "Redis 缓存", "index": "MySQL 索引", "rag": "RAG 检索", "none": "无"}
+
 
 @dataclass(frozen=True, slots=True)
 class _Snapshot:
@@ -290,6 +293,7 @@ class FAQService:
                 started,
                 reason=result.reason,
                 score=result.score,
+                margin=result.margin,
                 candidates=candidates,
                 subject=top_subject,
                 source="index",
@@ -308,6 +312,7 @@ class FAQService:
             record=snapshot.records[result.faq_id],
             score=result.score,
             reason=result.reason,
+            margin=result.margin,
             source="index",
             cache_state=cache_state,
             norm=norm,
@@ -367,13 +372,10 @@ class FAQService:
             self._stats.rebuilds += 1
             cost_ms = (time.perf_counter() - started) * 1000
             log.info(
-                "faq_rebuilt",
+                "faq_rebuild",
                 version=snapshot.version,
                 docs=snapshot.doc_count,
-                subject=subject,
                 cost_ms=round(cost_ms, 1),
-                # 缓存不主动删：key 带版本号，旧版本条目在 TTL 内自然淘汰
-                cache_scope="version_bump",
             )
             return {"version": snapshot.version, "docs": snapshot.doc_count, "cost_ms": round(cost_ms, 1)}
 
@@ -432,12 +434,7 @@ class FAQService:
                 if await self._cache.get(key) is None:
                     await self._cache.put(key, entry, ttl)
                     self._stats.cache_fills += 1
-                    log.info(
-                        "faq_cache_fill",
-                        faq_id=entry.faq_id,
-                        reason=entry.reason,
-                        ttl=ttl,
-                    )
+                    log.info("faq_cache_write", key=key, ttl=ttl)
             except Exception as exc:
                 self._stats.cache_errors += 1
                 log.warning("faq_cache_error", op="fill", error=str(exc))
@@ -512,6 +509,7 @@ class FAQService:
         source: str = "index",
         cache_state: str = "",
         norm: str = "",
+        margin: float = 0.0,
     ) -> FAQHit:
         latency_ms = (time.perf_counter() - started) * 1000
         self._stats.searches += 1
@@ -521,26 +519,40 @@ class FAQService:
         else:
             self._stats.misses += 1
 
-        # 每次查询一行结构化日志：命中来自缓存还是索引、命中哪条、分数多少、耗时多少。
-        # 排查"为什么答错"时，这一行是唯一的现场；没有它只能靠复现。
-        fields: dict[str, Any] = {
-            "hit": hit,
-            "reason": reason,
-            "source": source,
-            "cache": cache_state,
-            "faq_id": record.faq_id if record else None,
-            "subject": record.subject if record else subject,
+        # 每次查询一行结论日志：命中来自缓存/索引、命中哪条、分数、耗时。
+        # 排查"为什么答错"时这一行是唯一现场；未命中再补一行"转交 RAG"，便于按行 grep 统计交接率。
+        source_cn = _SOURCE_CN.get(source, source or "-")
+        q_text = (
+            f"问题: [{norm}]"
+            if (self._log_query and norm)
+            else f"q_hash: {hashlib.sha1(norm.encode('utf-8')).hexdigest()[:12] if norm else '-'}"
+        )
+        common: dict[str, Any] = {
+            "source_cn": source_cn,
+            "q_text": q_text,
             "score": round(score, 4),
-            "candidates": [c.faq_id for c in candidates],
             "latency_ms": round(latency_ms, 2),
-            "version": self._snapshot.version,
-            "q_len": len(norm),
-            "q_hash": hashlib.sha1(norm.encode("utf-8")).hexdigest()[:12] if norm else "",
         }
-        if self._log_query and norm:
-            # 原始问法属于个人数据，只在显式开启时以 DEBUG 落盘
-            log.debug("faq_search_query", q=norm)
-        log.info("faq_search", **fields)
+        if hit and record is not None:
+            log.info(
+                "faq_search_hit",
+                faq_id=record.faq_id,
+                subject=record.subject or "-",
+                **common,
+            )
+        else:
+            missing = {
+                "reason": reason,
+                "threshold": self._policy.threshold,
+                "margin": round(margin, 4),
+                "candidates": [c.faq_id for c in candidates] or "-",
+            }
+            log.info("faq_search_miss", subject=subject or "-", **common, **missing)
+            log.info(
+                "faq_handoff_rag",
+                q_text=q_text,
+                candidates=[c.question for c in candidates] or "-",
+            )
 
         if record is not None:
             return FAQHit(

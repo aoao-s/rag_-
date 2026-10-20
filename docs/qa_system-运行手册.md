@@ -91,28 +91,40 @@ curl "http://127.0.0.1:8124/metrics"
 
 ## 6. 日志与缓存（2026-10-20 新增）
 
-### 6.1 日志去哪了
+### 6.1 日志长什么样
 
-- 启动后 `logs/app.log` 会持续写入 JSON 行（`RotatingFileHandler`，50 MB 一份、保留 10 份）。
-  同时 stdout 也有一份（容器里 `docker logs` 能看到同样的行）。
+控制台与文件是**同一行格式**，文件更详细（`LOG_FILE_LEVEL=DEBUG`，控制台 `LOG_LEVEL=INFO`）：
+
+```
+2026-10-20 19:21:35.097 [INFO] [15624:MainThread] EduRAG.qa_system.res.qa_search (qa_search.py:537): 检索命中 [来源: MySQL 索引] 问题: [2次函数的顶点式] | faq_id: 148 | 学科: 数学 | 得分: 1.0 | 耗时: 6.21ms
+2026-10-20 19:21:35.150 [INFO] [15624:MainThread] EduRAG.qa_system.res.qa_search (qa_search.py:537): 检索命中 [来源: Redis 缓存] 问题: [2次函数的顶点式] | faq_id: 148 | 学科: 数学 | 得分: 1.0 | 耗时: 2.93ms
+2026-10-20 19:21:30.991 [INFO] [15624:MainThread] EduRAG.qa_system.res.qa_search (qa_search.py:550): 检索未命中 [来源: MySQL 索引] 问题: [顶点式怎么写] | 原因: ambiguous | 最高得分: 0.4165 (阈值: 0.25) | 分差: 0.028 | 候选: [150, 148, 1516] | 耗时: 7.1ms
+2026-10-20 19:21:30.991 [INFO] [15624:MainThread] EduRAG.qa_system.res.qa_search (qa_search.py:551): FAQ 未命中，转交 RAG 检索 问题: [顶点式怎么写] | 候选问题: ['一般式的顶点坐标', '二次函数的顶点式', 'y=2x²-8x+1 顶点']
+2026-10-20 19:21:44.133 [INFO] [15624:MainThread] EduRAG.qa_system.res.qa_cache (qa_cache.py:197): Redis 缓存续命 [Key: edurag:dev:faq:v1:*:d80bf0e909b254dacebd], 剩余 59s → 3600s
+```
+
+- 文件名 `logs/app.log`（`RotatingFileHandler`，50 MB 一份、保留 10 份，UTF-8），stdout 同时一份。
 - 业务日志与 uvicorn 访问日志走同一套 handler，所以"有请求没日志"不会再出现。
-- 常见事件名：
+- 文案由 `base/log_messages.py` 统一维护：改口径只改一处，不要在业务代码里拼字符串。
 
-| event | 含义 | 关键字段 |
+| 事件（event） | 渲染后的样子 | 关键字段 |
 | --- | --- | --- |
-| `faq_search` | 每次查询的结论 | `source`(index/cache)、`cache`(hit/miss)、`reason`、`score`、`candidates`、`latency_ms` |
-| `faq_db_query` | 读 MySQL | `op`(fetch_published/fetch_aliases)、`rows`、`cost_ms` |
-| `faq_cache_fill` / `faq_cache_slide` / `faq_cache_stale` | 回填 / 续命 / 缓存指向已下线条目 | `ttl`、`remaining_s` |
+| `faq_search_hit` | 检索命中 `[来源: Redis 缓存 / MySQL 索引]` … | `faq_id`、`subject`、`score`、`latency_ms` |
+| `faq_search_miss` | 检索未命中 … `最高得分 (阈值)`、`分差`、`候选` | `reason`(below_threshold/ambiguous)、`margin` |
+| `faq_handoff_rag` | FAQ 未命中，转交 RAG 检索 | `candidates` |
+| `faq_cache_write` / `faq_cache_slide` / `faq_cache_stale` | 回填 / 续命 / 缓存指向已下线条目 | `ttl`、`remaining_s` |
+| `faq_db_query` | MySQL 命中 [操作/行数/耗时] | `op`、`rows`、`cost_ms` |
 | `faq_cache_error` | 缓存读写异常（fail-open，不影响回答） | `op`、`error` |
-| `http_request` | 接入层请求 | `request_id`、`path`、`status`、`latency_ms` |
+| `http_request` | HTTP GET … -> 200 [x ms] | `status`、`latency_ms` |
 
 排查一条查询的完整链路：
 
 ```powershell
-# 按指纹找一次查询（默认不记原文，只记 q_hash 与 q_len）
-Select-String -Path logs\app.log -Pattern '"event": "faq_search"' | Select-Object -Last 5
-# 临时要看原文再开（默认关闭，避免学生隐私落盘）
-# .env: LOG_QUERY_TEXT=true
+Select-String -Path logs\app.log -Pattern '检索命中|检索未命中' | Select-Object -Last 5
+# 只统计命中来源分布
+Select-String -Path logs\app.log -Pattern '\[来源: (.+?)\]' | ForEach-Object { $_.Matches[0].Groups[1].Value } |
+  Group-Object | Sort-Object Count -Descending
+# 想看原始问法：.env 里 LOG_QUERY_TEXT=true（dev 默认已开；生产必须 false）
 ```
 
 ### 6.2 Redis 二级缓存

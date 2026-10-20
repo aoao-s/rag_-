@@ -168,8 +168,8 @@ RAGpro_智能教育系统/
 | `EVIDENCE_THRESHOLD` | 证据门阈值 τ |
 | `TOTAL_BUDGET_MS` | 单请求总预算（默认 8000） |
 | `JWT_SECRET` / `JWT_EXPIRE_MIN` | 接入层鉴权 |
-| `LOG_LEVEL` / `LOG_DIR` / `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` | 日志与轮转（默认 `INFO`、`logs`、50 MB、10 份） |
-| `LOG_QUERY_TEXT` | 是否把原始 query 写进日志；默认 `false`（只记长度与指纹，避免学生隐私落盘） |
+| `LOG_LEVEL` / `LOG_FILE_LEVEL` / `LOG_DIR` / `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` | 控制台级别 `INFO`、文件级别 `DEBUG`、`logs`、50 MB、10 份 |
+| `LOG_QUERY_TEXT` | 是否把原始 query 写进日志；dev `true` 便于排查，**生产必须 `false`**（避免学生隐私落盘） |
 | `FAQ_CACHE_ENABLED` / `FAQ_CACHE_TTL` | FAQ 二级缓存开关与正缓存 TTL（默认 `true` / 3600 s） |
 | `FAQ_CACHE_MAX_TTL` / `FAQ_CACHE_SLIDE_RATIO` | 绝对寿命 21600 s；剩余寿命 ≤ TTL×0.5 才续命 |
 | `FAQ_CACHE_NEGATIVE_TTL` | 未命中的负缓存 TTL（默认 30 s，带 top3 候选） |
@@ -369,11 +369,22 @@ main.py(api) → 编排层 → {理解, 检索, 生成, 知识} → base/ → �
 - 全量类型注解，`mypy` 基本严格；禁止 `Any` 泛滥（外部 SDK 边界可用一次并就地收敛）。
 - 一律 `async def`；**禁止在协程里做阻塞调用**（`requests`、`time.sleep`、同步 DB 驱动、`torch` 前向都要走 `run_in_executor` 或专用 GPU 线程）。
 - 异常：定义业务异常体系（`BudgetExceeded / UpstreamUnavailable / EmptyRetrieval / PolicyViolation / InternalError`），**禁止裸 `except Exception: pass`**；异常必须带 `trace_id` 与节点名。
-- 日志：`structlog` JSON，字段固定 `trace_id/request_id/node/latency_ms/extra`；**禁止 `print`**。
+- 日志格式固定为**人可读单行**（与旧项目 Ragpro 对齐，便于沿用既有 grep 习惯）：
+
+  ```
+  2026-10-20 19:21:30.840 [INFO] [15624:MainThread] EduRAG.qa_system.res.qa_search (qa_search.py:537): 检索命中 [来源: Redis 缓存] 问题: [勾股定理怎么证明] | faq_id: 180 | 学科: 数学 | 得分: 1.0 | 耗时: 6.19ms
+  ```
+
+  - 字段顺序：`时间.毫秒 [级别] [pid:线程] logger名 (文件:行号): 文案`；文案由 `base/log_messages.py` 的模板表渲染（事件名 → 中文），调用侧只传结构化字段，**禁止在业务代码里手写格式化字符串**。
+  - 控制台 `LOG_LEVEL`（默认 `INFO`，看结论）、文件 `LOG_FILE_LEVEL`（默认 `DEBUG`，留现场：缓存 key、SQL、续命）。
+  - 检索日志必须能一眼看出**命中来源**：`[来源: Redis 缓存]` / `[来源: MySQL 索引]` / `[来源: RAG 检索]`；未命中再补一行「FAQ 未命中，转交 RAG 检索」便于按行统计交接率。
+- 日志：`structlog` + 标准库 logging 单出口，字段固定 `trace_id/request_id/node/latency_ms/extra`；**禁止 `print`**。
   - 必须**双出口**：stdout（容器采集）+ `logs/app.log`（`RotatingFileHandler`，50 MB × 10 份，UTF-8）；只写 stdout 等于线上没有留档（m01712 踩过：配了 logger 但 `logs/` 是空的）。
   - 业务日志与 uvicorn/第三方库日志走**同一套 handler**：structlog 经 `stdlib.LoggerFactory` 落到标准库 logging，由 handler 上的 `ProcessorFormatter` 统一渲染。否则会出现"我们的日志有、访问日志没有"的半截现场。
   - `configure()` 必须可重复调用且**允许后补文件路径**（模块导入期先初始化 console，lifespan 拿到配置后补文件 handler）。
-  - 请求内用 `bind(request_id=..., path=...)` 绑定上下文，响应用 `X-Request-Id` 回传；默认**不记原始 query 正文**（学生可能带姓名/手机号），只记 `q_len`/`q_hash`，需要排查时用 `LOG_QUERY_TEXT=true` 临时打开。
+  - 请求内用 `bind(request_id=..., path=...)` 绑定上下文，响应用 `X-Request-Id` 回传；**默认**只记 `q_hash`，需要排查时用 `LOG_QUERY_TEXT=true` 打开原始问法（dev 默认已开）。**生产必须关闭**：学生会话里常带姓名/手机号/学校。
+  - `ProcessorFormatter` 必须显式传 `fmt`（它的默认值是 `"%(message)s"`，不传就只剩裸文案，没有时间/级别/行号）；调用点的 `filename/lineno` 由 `CallsiteParameterAdder` 注入，**不能**在字段过滤时把它们一起丢掉。
+  - 控制台流要设 `errors="backslashreplace"`：GBK 控制台遇到 `m/s²` 会抛 `UnicodeEncodeError`，logging 吞掉异常后**整行丢失**（实测踩过）。
 - 缓存：Redis 只放"可重算"的东西（FAQ 结论、会话热点、限流计数），MySQL 永远是真相源；**缓存读写必须 fail-open**（异常只记 `cache_errors` 指标并继续走索引），不允许因为 Redis 抖动把查询打挂。
 - 配置：只从 `base/config.py`（pydantic-settings）取；禁止在业务代码里写死 host/阈值/TTL。
 - 格式化与静态检查：`ruff format` + `ruff check --fix` + `mypy app`，提交前必须全绿。
@@ -619,7 +630,7 @@ class FAQService:                                   # qa_system/res/qa_search.py
 | 接口 | search/publish/deprecate/rebuild + healthz/readyz/metrics | 全部实现 | `X-Admin-Token` 保护写接口，未配置时仅本机调试 |
 | 数据面 | compose 起 mysql+redis | 独立端口 3307/6380，`pull_policy: never`，offline save/load 脚本 | 见 `docs/docker-离线部署.md` |
 | **Redis 二级缓存** | 可选缓存层（§5.2 缓存规范） | `RedisFAQCache` + `InMemoryFAQCache`（测试/无 Redis 时）+ `SingleFlight` | 正缓存 1 h/绝对 6 h、负缓存 30 s、命中续命（剩余 ≤50% 才写 EXPIRE）、负缓存带 top3 候选 |
-| **结构化日志** | structlog JSON + trace_id | `base/logger.py`：stdout + `logs/app.log` 轮转（50 MB×10），uvicorn 日志统一走同套 handler | 请求日志带 `request_id/path/status/latency_ms`；业务日志 `faq_search/faq_db_query/faq_cache_*` |
+| **可读日志** | structlog + 标准库 logging 单出口 | `base/logger.py`（行格式 + 轮转 + 落盘）、`base/log_messages.py`（事件 → 中文文案） | 控制台 `INFO` / 文件 `DEBUG`；检索行必须带 `[来源: Redis 缓存 / MySQL 索引 / RAG 检索]`；`faq_cache_write/faq_cache_slide/faq_db_query/faq_search_hit/faq_search_miss/faq_handoff_rag` |
 
 代码位置：`base/{config,labels,contracts,logger,db}.py`（地基）、`qa_system/res/{qa_normalize,qa_corpus,qa_matcher,qa_db,qa_cache,qa_search,qa_csv}.py`（qa_system）、`qa_system/api.py` + `main.py`（HTTP）、`scripts/{init_db,import_faq,eval_faq,docker_up,docker_down}.py|ps1`、`tests/`（46 条用例）。
 
@@ -832,6 +843,7 @@ MemoryWriter.on_turn(user_id, sid, turn) -> None
 | 2026-10-20 | 新增无库模式：`FAQ_CORPUS_CSV` 从 CSV 装载语料（`qa_system/res/qa_csv.py` 与 `scripts/eval_faq.py` 共用），MySQL 仍为生产真相源 | 项目组 |
 | 2026-10-20 | **离线数据面落地**：`docker/docker-compose.yml` 端口/账号全部取自 `.env`（MySQL 3307 / Redis 6380，避开旧项目占用的 3306/6379），每个服务 `pull_policy: never`；`docker/offline/{save,load}.ps1` 导出/导入镜像（mysql 237 MB + redis 55 MB）；`scripts/{docker_up,docker_down}.ps1` 封装 `--env-file` 与健康等待；文档 `docs/docker-离线部署.md`。实测 MySQL 8.0.46 + Redis 健康，2000 条 FAQ 入库 | 项目组 |
 | 2026-10-20 | **全局日志 + FAQ 二级缓存**：`base/logger.py` 改为 stdout + `logs/app.log`（50 MB×10 轮转），structlog 经 `stdlib.LoggerFactory` 与 uvicorn 日志共用 handler（修掉"配了 logger 但文件为空"）；`qa_system/res/qa_cache.py` 新增 Redis 正/负缓存、绝对寿命、命中续命、`SingleFlight`；缓存 key 加 `edurag:{env}` 前缀；补 `LOG_*` / `FAQ_CACHE_*` 环境变量；57 条单测全绿 | 项目组 |
+| 2026-10-20 | **日志改为人读行格式**：`base/log_messages.py` 事件→中文文案表；行格式 `时间.毫秒 [级别] [pid:线程] logger (文件:行): 文案`（与旧项目 Ragpro 对齐）；检索结果单行带 `[来源: Redis 缓存 / MySQL 索引]`，未命中补一行「转交 RAG 检索」；分 `LOG_LEVEL`（控制台）/`LOG_FILE_LEVEL`（文件）；`LOG_QUERY_TEXT` dev 置 `true` | 项目组 |
 
 
 
