@@ -43,13 +43,15 @@ class Settings(BaseSettings):
     redis_db: int = Field(default=0, alias="REDIS_DB")
 
     # ---- qa_system 参数（CLAUDE.md §7.1.2）----
-    faq_threshold: float = Field(default=0.62, alias="FAQ_THRESHOLD")
-    faq_margin: float = Field(default=0.05, alias="FAQ_MARGIN")
+    faq_threshold: float = Field(default=0.25, alias="FAQ_THRESHOLD")
+    faq_margin: float = Field(default=0.10, alias="FAQ_MARGIN")
     faq_top_k: int = Field(default=20, alias="FAQ_TOP_K")
     faq_norm_k: float = Field(default=12.0, alias="FAQ_NORM_K")
     faq_candidate_n: int = Field(default=3, alias="FAQ_CANDIDATE_N")
     faq_alias_enabled: bool = Field(default=True, alias="FAQ_ALIAS_ENABLED")
     faq_admin_token: str = Field(default="", alias="FAQ_ADMIN_TOKEN")
+    # 本地无数据库时从 CSV 装载语料（相对仓库根目录）；生产留空，走 MySQL 真相源
+    faq_corpus_csv: str = Field(default="", alias="FAQ_CORPUS_CSV")
 
     # ---- 启动行为 ----
     # dev 下允许数据库不可用时以"空 FAQ 语料"启动，便于纯本地跑通链路；生产必须关闭
@@ -80,4 +82,5 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
 

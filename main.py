@@ -25,6 +25,7 @@ from base.db import MySQL
 from base.logger import bind, clear, configure, get_logger, new_request_id
 from qa_system.api import router as faq_router
 from qa_system.res.qa_cache import create_redis
+from qa_system.res.qa_csv import load_csv_records
 from qa_system.res.qa_db import (
     FAQRepository,
     InMemoryFAQRepository,
@@ -58,8 +59,35 @@ class Container:
             self.redis = None
 
     async def load_faq(self) -> None:
+        s = self.settings
+
+        # 无库模式：显式配置 FAQ_CORPUS_CSV 时从 CSV 装载，写接口仍落在内存仓库
+        # （用于本地演示、CI 与没有 docker 的开发机；生产必须留空，MySQL 才是真相源）
+        if s.faq_corpus_csv:
+            from pathlib import Path
+
+            csv_path = Path(s.faq_corpus_csv)
+            if not csv_path.is_absolute():
+                csv_path = Path(__file__).resolve().parent / csv_path
+            records = load_csv_records(csv_path)
+            repository: FAQRepository = InMemoryFAQRepository(records)
+            service = FAQService(
+                repository,
+                policy=_policy_from(s),
+                alias_enabled=s.faq_alias_enabled,
+                top_k=s.faq_top_k,
+                extra_words=s.subjects,
+            )
+            info = await service.load()
+            await service.warmup()
+            self.faq_repository = repository
+            self.faq_service = service
+            log.warning("faq_corpus_from_csv", path=str(csv_path), docs=info.get("docs"))
+            log.info("faq_ready", degraded=self.degraded, **info)
+            return
+
         assert self.mysql is not None
-        repository: FAQRepository = MySQLFAQRepository(self.mysql)
+        repository = MySQLFAQRepository(self.mysql)
         service = FAQService(
             repository,
             policy=_policy_from(self.settings),

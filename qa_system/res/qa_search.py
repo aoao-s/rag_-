@@ -1,4 +1,4 @@
-﻿"""FAQService：qa_system 的唯一对外入口。
+"""FAQService：qa_system 的唯一对外入口。
 
 职责：
 - 启动时把 published 语料装载成"分学科 BM25 索引 + 精确哈希表"，之后请求路径**零 IO、零模型**；
@@ -24,7 +24,7 @@ from base.contracts import FAQCandidate, FAQHit
 from base.labels import SUBJECTS, normalize_subject
 from base.logger import get_logger
 from qa_system.res.qa_corpus import BM25Index, IndexedDoc
-from qa_system.res.qa_matcher import MatchPolicy, decide
+from qa_system.res.qa_matcher import MatchPolicy, decide, normalize_score
 from qa_system.res.qa_normalize import Normalizer
 from qa_system.res.qa_db import FAQRecord, FAQRepository
 
@@ -207,6 +207,39 @@ class FAQService:
             score=result.score,
             reason=result.reason,
         )
+
+    # ------------------------------------------------------------------ 离线评估
+    async def rank(self, query: str, subject: str | None = None, top_k: int = 3) -> list[tuple[int, float]]:
+        """返回 (faq_id, 归一化分) 降序，不做命中判定。
+
+        供离线阈值标定与排障使用：`search()` 只能看到"最终结论"，看不出 top1/top2 的分差，
+        而 margin 恰恰是区分"同题族"（勾股定理内容 / 勾股定理证明）的关键信号。
+        """
+        snapshot = self._snapshot
+        if snapshot.version == 0 or not snapshot.records:
+            return []
+
+        normalizer = snapshot.normalizer
+        norm = normalizer.normalize(query or "")
+        if not norm:
+            return []
+
+        faq_id = snapshot.exact.get(norm)
+        if faq_id is not None:
+            return [(faq_id, 1.0)]
+
+        tokens = normalizer.tokens(norm)
+        if not tokens:
+            return []
+
+        best: dict[int, float] = defaultdict(float)
+        for index in self._select_indexes(snapshot, normalize_subject(subject)):
+            for doc, score in index.search(tokens, top_k=self._top_k):
+                if score > best[doc.faq_id]:
+                    best[doc.faq_id] = score
+
+        ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+        return [(fid, normalize_score(raw, self._policy.norm_k)) for fid, raw in ranked]
 
     # ------------------------------------------------------------------ 写路径
     async def publish(self, faq_id: int, operator: str = "api") -> dict[str, Any]:

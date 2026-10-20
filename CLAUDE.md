@@ -1,4 +1,4 @@
-﻿# EduRAG-Pro 智能教育知识库系统
+# EduRAG-Pro 智能教育知识库系统
 
 > 项目代号：EduRAG-Pro 1.41　|　形态：**交付项目**（非演示 Demo）　|　硬件：**有 GPU**　|　状态：架构设计完成，待实现
 > 本文件是本仓库的"项目宪法"：给人和给 AI 编码助手共用。改动架构决策时，**先改本文件，再改代码**。
@@ -153,6 +153,8 @@ RAGpro_智能教育系统/
 | `APP_ENV` / `APP_VERSION` | `dev` / `staging` / `prod`；版本号用于日志与灰度 |
 | `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE` | MySQL 连接 |
 | `REDIS_HOST/PORT/PASSWORD/DB` | Redis 连接（compose 里 `requirepass` 必须与此一致） |
+| `FAQ_THRESHOLD` / `FAQ_MARGIN` | FAQ 命中绝对分与领先幅度；已标定为 0.25 / 0.10，改 `FAQ_NORM_K` 必须重标 |
+| `FAQ_CORPUS_CSV` | 无库模式：从该 CSV 装载 FAQ 语料；生产留空（MySQL 是真相源） |
 | `MILVUS_HOST/PORT/DATABASE/COLLECTION` | Milvus 连接与集合名 |
 | `MINIO_ENDPOINT/ACCESS_KEY/SECRET_KEY/BUCKET` | 原始文档存储 |
 | `LLM_API_KEY` / `LLM_BASE_URL` | 生成模型网关（不写死、不进镜像） |
@@ -257,7 +259,7 @@ RAGpro_智能教育系统/
 QAF = Question–Answer–Feedback 闭环数据集；Tag 是贯穿路由、检索、评测、权限、记忆的横向元数据。
 
 1. **QA 生命周期**：`draft → pending → published → deprecated`，发布即建索引（BM25 内存语料 + Milvus `qa` collection），5 分钟内生效。
-2. **命中判定**三条件：归一化分数 ≥0.62、top1−top2 ≥0.05、学科一致；未命中转 RAG 并携带 top3 候选（不要硬阈值 8.0 那种写法）。
+2. **命中判定**三条件：归一化分数 ≥0.25、top1−top2 ≥0.10、学科一致；未命中转 RAG 并携带 top3 候选（不要硬阈值 8.0 那种写法；0.25/0.10 由 `scripts/eval_faq.py calibrate` 在本语料 480 条同义问法上标定，precision 0.95）。
 3. **反馈必须带 `request_id`**，标签固定枚举，日聚合后触发"QA 修订 / 未命中池 / 文档缺口"三类任务。
 4. **Tag 九个命名空间**：intent / subject / course / level / scenario / audience / doc_type / risk / acl；打标 = AC 自动机 + 正则 + `deepseek-flash` 零样本（置信度 <0.6 转人工）。
 5. **发布硬门槛**：`published` 的 QA 必须至少有一个 `subject` 标签，否则不发布（检索过滤要用）。
@@ -539,7 +541,7 @@ faq_alias(id BIGINT PK AI, faq_id BIGINT, alias VARCHAR(1000),
 - 归一化：全半角、大小写、去标点与语气词（"请问/一下/呢"）、数字统一（"三个月"↔"3个月"）、口语同义（咋→怎么、啥→什么）、别名整串映射。
 - 分词：jieba + 领域词典（课程名、证书名、学科术语），加载时一次性建好，请求期不加载。
 - **分数归一化**（旧项目直接用原始 BM25 分数对比 8.0，是最大缺陷）：`score_norm = bm25 / (bm25 + 12.0)`，落在 (0,1)。
-- 命中三条件（全部满足才算命中）：`score_norm ≥ 0.62`、`top1 − top2 ≥ 0.05`、`subject` 一致或无冲突。
+- 命中三条件（全部满足才算命中）：`score_norm ≥ 0.25`、`top1 − top2 ≥ 0.10`、`subject` 一致或无冲突。
 
 ```python
 @dataclass(frozen=True)
@@ -595,7 +597,7 @@ class FAQService:                                   # qa_system/res/qa_search.py
 代码位置：`base/{config,labels,contracts,logger,db}.py`（地基）、`qa_system/res/{qa_normalize,qa_corpus,qa_matcher,qa_db,qa_search}.py`（qa_system）、`qa_system/api.py` + `main.py`（HTTP）、`scripts/{init_db,import_faq}.py`、`tests/`（46 条用例）。
 
 实测：160 条 K12 FAQ；服务端 `search` 平均 0.3 ms；端到端（keep-alive）p50 5.7 ms / p95 9.1 ms。
-`FAQ_THRESHOLD=0.62` **尚未标定**——近义问法得 0.35 会落到 RAG，属预期；标定要用 `datasets/07_eval` 的 157 条跑 P/R 曲线（PR2 第二步）。
+`FAQ_THRESHOLD` 已标定：`scripts/eval_faq.py` 用 deepseek-flash 为 160 条 FAQ 生成 480 条同义问法（+80 条题库负样本），二维扫描后取 **threshold=0.25 + margin=0.10**（召回 0.637 / 精度 0.950）。分数尺度依赖 `FAQ_NORM_K=12`，改 K 必须重跑标定；线上真实流量积累 2 周后要用真实点击重标。
 
 ---
 
@@ -798,7 +800,11 @@ MemoryWriter.on_turn(user_id, sid, turn) -> None
 | 2026-10-19 | 意图标签改为 `INTENT_LABELS` 配置驱动：数据集口径（K12 教学 6 类）与文档口径（招生 5 类）并存，拍板前不得把标签写死进代码或索引 | 项目组 |
 | 2026-10-20 | **PR1 地基 + PR2 qa_system 落地**：`base/` 五个基础模块（config/labels/contracts/logger/db）、`qa_system/res/` 六个模块、`/v1/faq/*` 六个接口、`/healthz` `/readyz` `/metrics`；`scripts/init_db.py`（含旧库补列与非 K12 历史行下线）、`scripts/import_faq.py`；46 条单测全绿；实测 160 条 K12 语料、search 端到端 p95 9.1 ms | 项目组 |
 | 2026-10-20 | **目录结构对齐旧项目 Ragpro**：根 `main.py` + `base/`（config/logger/labels/contracts/db）+ `qa_system/{api.py,res/qa_*.py}` + `rag_system/core/` + `docker/` + `logs/`；去掉 `app/`、`pyproject.toml`、`services/`、`eval/`、`web/`，改用 `requirements.txt` + `pytest.ini`；`python main.py` 可直接起服务 | 项目组 |
-| 2026-10-20 | 实现层三处收敛并写回 §7.1.6：别名只做整串等价、热更新先全量重建（>5 万条再上事件流）、归一化加口语同义词表；`FAQ_THRESHOLD` 待用 `datasets/07_eval` 标定 | 项目组 |
+| 2026-10-20 | 实现层三处收敛并写回 §7.1.6：别名只做整串等价、热更新先全量重建（>5 万条再上事件流）、归一化加口语同义词表 | 项目组 |
+| 2026-10-20 | **FAQ 阈值标定完成**：`scripts/eval_faq.py`（gen 480 条同义问法 + calibrate 二维扫描），报告 `docs/analysis/faq_threshold_report.md`；定 `FAQ_THRESHOLD=0.25`、`FAQ_MARGIN=0.10`（precision 0.950 / recall 0.637），`MatchPolicy` 与 `.env` 同步 | 项目组 |
+| 2026-10-20 | 新增无库模式：`FAQ_CORPUS_CSV` 从 CSV 装载语料（`qa_system/res/qa_csv.py` 与 `scripts/eval_faq.py` 共用），MySQL 仍为生产真相源 | 项目组 |
+
+
 
 
 

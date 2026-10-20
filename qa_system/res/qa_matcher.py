@@ -1,4 +1,4 @@
-"""命中判定：把"原始 BM25 分"变成"可跨学科解释的概率"。
+﻿"""命中判定：把"原始 BM25 分"变成"可跨学科解释的概率"。
 
 旧项目直接用 `best_score >= 8.0` 判定，问题是：原始分随语料规模、文档长度、学科分布漂移，
 换个学科阈值就失效，日志里出现过"最高得分 7.16（阈值 8.0）"这种差一点就全错的场景。
@@ -15,8 +15,8 @@ from dataclasses import dataclass
 class MatchPolicy:
     """命中策略。参数基线见 CLAUDE.md §7.1.2。"""
 
-    threshold: float = 0.62
-    margin: float = 0.05
+    threshold: float = 0.25
+    margin: float = 0.10
     norm_k: float = 12.0
     candidate_n: int = 3
 
@@ -68,3 +68,4 @@ def decide(scored: list[tuple[int, float]], policy: MatchPolicy = MatchPolicy())
             reason="ambiguous",
         )
     return MatchResult(hit=True, faq_id=top_id, score=top_score, margin=margin, reason="ok")
+
