@@ -79,6 +79,55 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
+class _StdlibAdapter:
+    """把 structlog 风格调用（`log.info("event", key=value)`）适配到标准库。
+
+    没有 structlog 的环境（精简虚拟环境、只装了运行依赖的机器）里，如果直接返回
+    `logging.Logger`，`log.warning("mysql_ping_failed", error=str(exc))` 会抛
+    `TypeError: Logger._log() got an unexpected keyword argument 'error'`——
+    而且是在异常处理分支里二次崩溃，掩盖真正的错误（如 1045 密码错误）。
+    """
+
+    __slots__ = ("_logger",)
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+
+    @staticmethod
+    def _render(event: str, kwargs: dict[str, Any]) -> str:
+        if not kwargs:
+            return str(event)
+        extras = " ".join(f"{k}={v}" for k, v in kwargs.items() if k != "exc_info")
+        return f"{event} {extras}" if extras else str(event)
+
+    def _log(self, level: int, event: str, *args: Any, **kwargs: Any) -> None:
+        exc_info = kwargs.pop("exc_info", None)
+        if args:  # 兼容 printf 风格
+            event = event % args if args else event
+        self._logger.log(level, self._render(event, kwargs), exc_info=exc_info)
+
+    def debug(self, event: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.DEBUG, event, *args, **kwargs)
+
+    def info(self, event: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.INFO, event, *args, **kwargs)
+
+    def warning(self, event: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.WARNING, event, *args, **kwargs)
+
+    warn = warning
+
+    def error(self, event: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.ERROR, event, *args, **kwargs)
+
+    def exception(self, event: str, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("exc_info", True)
+        self._log(logging.ERROR, event, *args, **kwargs)
+
+    def critical(self, event: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.CRITICAL, event, *args, **kwargs)
+
+
 def get_logger(name: str) -> Any:
     configure()
     if _HAS_STRUCTLOG:
@@ -89,4 +138,4 @@ def get_logger(name: str) -> Any:
         handler.setFormatter(_JsonFormatter())
         logger.addHandler(handler)
         logger.propagate = False
-    return logger
+    return _StdlibAdapter(logger)

@@ -33,7 +33,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from base.config import get_settings  # noqa: E402
+from base.config import BASE_DIR, ENV_FILE, get_settings  # noqa: E402
 from base.contracts import FAQHit  # noqa: E402
 from base.logger import configure, get_logger  # noqa: E402
 from qa_system.res.qa_db import FAQRepository, InMemoryFAQRepository, MySQLFAQRepository  # noqa: E402
@@ -76,11 +76,21 @@ async def build_service(*, use_csv: bool, limit: int | None) -> FAQService:
     settings = get_settings()
     policy = build_policy(settings)
 
+    # 配置问题先喊出来：最常见的失败是"换个工作目录启动 → 读不到 .env → 密码为空 → 1045"
+    problems = settings.self_check()
+    if problems:
+        print(f"[!] 配置自检未通过（配置文件：{ENV_FILE}，存在={ENV_FILE.exists()}）")
+        for problem in problems:
+            print(f"    - {problem}")
+        print()
+
     repository: FAQRepository
     if use_csv:
         from qa_system.res.qa_csv import load_csv_records
 
         csv_path = Path("datasets/04_faq/edu_faq.csv")
+        if not csv_path.is_absolute():
+            csv_path = BASE_DIR / csv_path
         records = load_csv_records(csv_path, limit=limit)
         repository = InMemoryFAQRepository(records)
         print(f"[i] 语料来源：{csv_path}（{len(records)} 条）")
@@ -90,8 +100,12 @@ async def build_service(*, use_csv: bool, limit: int | None) -> FAQService:
         mysql = MySQL(settings)
         if not mysql.ping():
             raise SystemExit(
-                "[x] 连不上 MySQL。先确认容器已启动（scripts\\docker_up.ps1），"
-                "或改用 --csv 走本地语料。"
+                f"[x] 连不上 MySQL：{settings.mysql_user}@{settings.mysql_host}:{settings.mysql_port}"
+                f"/{settings.mysql_database}\n"
+                f"    配置文件：{ENV_FILE}（存在={ENV_FILE.exists()}）\n"
+                f"    1) 容器是否在跑：docker ps --filter name=edurag-\n"
+                f"    2) 端口/密码是否与 .env 一致（默认 3307 / 见 MYSQL_PASSWORD）\n"
+                f"    3) 只想离线试：加 --csv 走本地语料"
             )
         repository = MySQLFAQRepository(mysql)
         print(f"[i] 语料来源：MySQL {settings.mysql_host}:{settings.mysql_port}/{settings.mysql_database}")
@@ -233,6 +247,23 @@ async def main_async(args: argparse.Namespace) -> int:
     import logging
 
     logging.getLogger("jieba").setLevel(logging.WARNING)
+
+    # 依赖自检：用错解释器是最高频的坑（比如系统 python / 另一个 conda 环境）
+    missing = []
+    for module in ("jieba", "pymysql", "dbutils", "pydantic_settings"):
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(module)
+    if missing:
+        raise SystemExit(
+            f"[x] 当前解释器缺依赖：{', '.join(missing)}\n"
+            f"    解释器：{sys.executable}\n"
+            f"    解决：用项目虚拟环境 .\\.venv\\Scripts\\python.exe -m qa_system.main，\n"
+            f"          或给这个环境装依赖：{sys.executable} -m pip install -r requirements.txt"
+        )
+
+    print(f"[i] 解释器：{sys.executable}")
     service = await build_service(use_csv=args.csv, limit=args.limit)
 
     try:

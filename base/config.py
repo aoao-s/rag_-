@@ -6,16 +6,23 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from base.labels import INTENT_LABELS, SUBJECTS
 
+# 仓库根目录（base/ 的父目录）。.env 与 datasets 都按它定位，
+# 不能用相对路径——否则换个工作目录启动（PyCharm 直接 run、定时任务）就读不到配置，
+# 表现为 "Access denied ... (using password: NO)"，极难排查。
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = BASE_DIR / ".env"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(ENV_FILE),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
