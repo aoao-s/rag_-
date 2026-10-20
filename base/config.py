@@ -75,6 +75,71 @@ class Settings(BaseSettings):
     # dev 下允许数据库不可用时以"空 FAQ 语料"启动，便于纯本地跑通链路；生产必须关闭
     allow_degraded_start: bool = Field(default=True, alias="ALLOW_DEGRADED_START")
 
+    # ---- 文档与切分（CLAUDE.md §7.2 知识库）----
+    # 待入库的原始资料目录：相对仓库根目录，逗号分隔可写多个
+    rag_docs_dir: str = Field(
+        default="datasets/01_textbook,datasets/02_lesson_plans,datasets/08_subtitles",
+        alias="RAG_DOCS_DIR",
+    )
+    # 父块：语义完整、随答案一起进 prompt；子块：只用来被检索命中
+    rag_parent_size: int = Field(default=1200, alias="RAG_PARENT_SIZE")
+    rag_parent_overlap: int = Field(default=100, alias="RAG_PARENT_OVERLAP")
+    rag_child_size: int = Field(default=300, alias="RAG_CHILD_SIZE")
+    rag_child_overlap: int = Field(default=20, alias="RAG_CHILD_OVERLAP")
+    # 单篇文档最多产出多少子块，防止一份几百页的 PDF 把库撑爆
+    rag_max_chunks_per_doc: int = Field(default=2000, alias="RAG_MAX_CHUNKS_PER_DOC")
+
+    # ---- 在线检索与重排 ----
+    # 每路 ANN 召回条数：融合后按父块去重，实际留存的父块远少于这个数
+    rag_top_k: int = Field(default=40, alias="RAG_TOP_K")
+    # 最终进 prompt 的父块数（证据条数）
+    rag_final_n: int = Field(default=6, alias="RAG_FINAL_N")
+    # CPU 上没有 GPU 重排可用时关掉，按融合分排序
+    rag_rerank_enabled: bool = Field(default=True, alias="RAG_RERANK_ENABLED")
+    # 只对前 N 条候选重排：CPU 上重排 80 条要数秒，GPU 上 200ms 内可跑完 40 条
+    rag_rerank_candidates: int = Field(default=40, alias="RAG_RERANK_CANDIDATES")
+    # 送入重排的父块截断字符数，约等于 512 token
+    rag_rerank_chars: int = Field(default=2000, alias="RAG_RERANK_CHARS")
+    rag_rerank_max_length: int = Field(default=512, alias="RAG_RERANK_MAX_LENGTH")
+    rag_reranker_path: str = Field(
+        default="../Ragpro/rag_system/models/BAAI/bge-reranker-v2-m3", alias="RAG_RERANKER_PATH"
+    )
+    # 重排模型用 fp16 需要 GPU；CPU 上 fp16 会直接报错
+    rag_use_fp16: bool = Field(default=True, alias="RAG_USE_FP16")
+    # 证据门（CLAUDE.md §7.2.1 第⑥步）：低于门槛不生成，宁可转人工
+    rag_evidence_threshold: float = Field(default=0.35, alias="RAG_EVIDENCE_THRESHOLD")
+    rag_evidence_margin: float = Field(default=0.03, alias="RAG_EVIDENCE_MARGIN")
+    rag_evidence_min_docs: int = Field(default=1, alias="RAG_EVIDENCE_MIN_DOCS")
+
+    # ---- 向量库 Milvus（CLAUDE.md §8.1）----
+    milvus_uri: str = Field(default="http://127.0.0.1:19531", alias="MILVUS_URI")
+    milvus_database: str = Field(default="edurag", alias="MILVUS_DATABASE")
+    milvus_collection: str = Field(default="edurag_chunk", alias="MILVUS_COLLECTION")
+    milvus_token: str = Field(default="", alias="MILVUS_TOKEN")
+    # BGE-M3 输出 1024 维；改模型必须同步改这里，否则 upsert 直接报维度不匹配
+    milvus_dim: int = Field(default=1024, alias="MILVUS_DIM")
+
+    # ---- 向量化 ----
+    # auto：有 FlagEmbedding+模型就用真模型，否则用确定性哈希向量（只给测试/离线跑通用）
+    rag_embed_backend: str = Field(default="auto", alias="RAG_EMBED_BACKEND")
+    rag_embed_model_path: str = Field(
+        default="../Ragpro/rag_system/models/BAAI/bge-m3", alias="RAG_EMBED_MODEL_PATH"
+    )
+    # cuda / cpu / auto
+    rag_embed_device: str = Field(default="auto", alias="RAG_EMBED_DEVICE")
+    rag_embed_fp16: bool = Field(default=True, alias="RAG_EMBED_FP16")
+    rag_embed_batch_size: int = Field(default=8, alias="RAG_EMBED_BATCH_SIZE")
+    rag_embed_max_length: int = Field(default=512, alias="RAG_EMBED_MAX_LENGTH")
+
+    # ---- MinerU 云解析（PDF 专用，CLAUDE.md §7.2.1）----
+    mineru_token: str = Field(default="", alias="MINERU_TOKEN")
+    mineru_base: str = Field(default="https://mineru.net/api/v4", alias="MINERU_BASE")
+    mineru_model: str = Field(default="vlm", alias="MINERU_MODEL")
+    mineru_poll_interval: int = Field(default=5, alias="MINERU_POLL_INTERVAL")
+    mineru_timeout_s: int = Field(default=900, alias="MINERU_TIMEOUT_S")
+    # 解析结果缓存目录：同一份 PDF 只花一次额度（相对仓库根目录）
+    mineru_cache_dir: str = Field(default="data/mineru", alias="MINERU_CACHE_DIR")
+
     # ---- FAQ 二级缓存（Redis，见 CLAUDE.md §7.1.2）----
     faq_cache_enabled: bool = Field(default=True, alias="FAQ_CACHE_ENABLED")
     # 命中后写入 Redis 的热数据存活时间（滑动续命），单位秒
@@ -89,6 +154,21 @@ class Settings(BaseSettings):
     @property
     def log_path(self) -> Path:
         return BASE_DIR / self.log_dir / self.log_file
+
+    @property
+    def rag_docs_paths(self) -> list[Path]:
+        """RAG_DOCS_DIR 允许逗号分隔多个目录，统一解析成绝对路径。"""
+        items = [p.strip() for p in self.rag_docs_dir.split(",") if p.strip()]
+        return [(BASE_DIR / p).resolve() for p in items]
+
+    @property
+    def embed_model_path(self) -> Path:
+        p = Path(self.rag_embed_model_path).expanduser()
+        return p if p.is_absolute() else (BASE_DIR / p).resolve()
+
+    @property
+    def mineru_cache_path(self) -> Path:
+        return (BASE_DIR / self.mineru_cache_dir).resolve()
 
     @property
     def intent_labels(self) -> tuple[str, ...]:

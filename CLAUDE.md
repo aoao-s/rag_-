@@ -708,6 +708,27 @@ class LLMGateway:                                  # rag_system/core/llm_gateway
 
 黄金集 Recall@10 ≥0.90、MRR ≥0.75；检索+重排 p95 ≤170 ms（GPU）；首 token p95 ≤1.2 s；引用可定位率 100%；编造率抽检 ≤2%。
 
+#### 7.2.6 实现现状（PR3 第一批，切分/入库/检索）
+
+| 能力 | 代码位置 | 说明 |
+|---|---|---|
+| 加载分发 | `rag_system/document_loaders/thy_factory.py` | 按后缀选 loader；`.md/.txt` 多编码兜底（utf-8-sig/gbk/gb18030，乱码率 >0 直接报错而不是悄悄进库） |
+| 文本/字幕/Office | `loader_text.py`、`loader_office.py` | 字幕去时间轴与序号；front-matter 剥离 |
+| PDF | `loader_pdf_mineru.py` | MinerU 云 API，结果按文件 md5 缓存到 `data/mineru/` |
+| 学科识别 | `document_loaders/base.py::guess_subject` | 先按 `-` 分词命中，再整串子串兜底；认不出返回 None（不猜） |
+| 父/子块切分 | `rag_system/text_splitters/parent_child.py` | 父块按标题树聚合、按标点装箱；子块继承父块标题；每子块携带 `parent_text` |
+| 向量化 | `rag_system/embedding/bge_m3.py` | `BGEM3FlagModel` 一次出 dense+sparse；无 torch/无权重时退 `HashEmbedder` 并打 warning |
+| 入库 | `rag_system/ingest.py` | CLI + `IngestPipeline.run()`；先按 `source` 删后写；单文件失败隔离；`--dry-run` 不连库；落 `data/ingest_manifest.json` |
+| 向量库 | `rag_system/store/milvus_store.py` | `ensure_collection`（HNSW COSINE + SPARSE_INVERTED_INDEX）、`upsert` 分批 64、`delete_by_source`、`hybrid_search`（WeightedRanker 0.7/0.3）、标量过滤 `subject/doc_type` |
+| 在线检索 | `rag_system/core/retriever.py` | 混合召回 → 父块合并去重 → 可选重排 → `final_n`；重排失败降级为融合分并记 `degraded` |
+| 重排 | `rag_system/core/reranker.py` | `FlagReranker` 懒加载 + 单例，`normalize=True` |
+| 证据门 | `rag_system/core/evidence_gate.py` | 三条件：分数、top1-top2 间隔、证据数；孤证额外 +0.10 门槛 |
+| 冒烟脚本 | `scripts/smoke_rag.py` | `--backend hash` 验证管线；默认验证真实质量；拒答按设计行为打印 |
+
+**已验证**：hash 后端跑通「6 份教材 → 17 子块 → 写入 Milvus → 混合检索 → 证据门」，全链路 4.5 s（含建库建集合）；单测 79 条全绿（切分 7 + 入库 6 + 检索/证据门 9 + qa 57）。
+
+**未验证/未做**：真 BGE-M3 端到端（本机 torch 下载受网络限制，待权重装好后重跑 `smoke_rag.py`）；重排延迟基线；黄金集 Recall/MRR；索引版本化与 alias 切换。
+
 ---
 
 ### 7.3 记忆模块
