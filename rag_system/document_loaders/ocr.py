@@ -1,4 +1,4 @@
-"""OCR 引擎：进程内单例，优先 GPU 版 rapidocr_paddle，缺了退 onnxruntime。
+﻿"""OCR 引擎：进程内单例，优先 GPU 版 rapidocr_paddle，缺了退 onnxruntime。
 
 为什么单例：模型权重几百 MB，每份文档建一次会 OOM，且冷启动 2–5 s。
 为什么不在请求路径调用：OCR 只在**入库期**跑（Office 内嵌图、扫描 PDF、图片文件），
@@ -74,10 +74,13 @@ def ocr_array(image: np.ndarray) -> str:
     return "\n".join(lines)
 
 
-def ocr_image_bytes(data: bytes, *, max_side: int = 2000) -> str:
+def ocr_image_bytes(data: bytes, *, max_side: int = 2000, min_side: int = 600) -> str:
     """图片字节 → OCR 文本。
 
-    `max_side`：超大图先等比缩小，否则检测模型会跑很久（教材插图常见 4000px）。
+    两个尺寸处理都是为准确率：
+    - `max_side`：超大图先等比缩小，否则检测模型会跑很久（教材插图常见 4000px）；
+    - `min_side`：过小的图先放大（默认只在最长边 < 600px 时触发）。放大能救回笔画，
+      但放太大反而让 `^` 被识别成 `~`，所以上限 2 倍。
     """
     from io import BytesIO
 
@@ -86,11 +89,27 @@ def ocr_image_bytes(data: bytes, *, max_side: int = 2000) -> str:
     try:
         with Image.open(BytesIO(data)) as im:
             rgb = im.convert("RGB")
-            w, h = rgb.size
-            if max(w, h) > max_side:
-                scale = max_side / max(w, h)
-                rgb = rgb.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+            rgb = _rescale(rgb, max_side=max_side, min_side=min_side)
             return ocr_array(np.array(rgb))
     except Exception as exc:  # pragma: no cover - 损坏图片
         log.warning("ocr_image_failed", error=f"{type(exc).__name__}: {exc}")
         return ""
+
+
+def _rescale(image, *, max_side: int, min_side: int):  # noqa: ANN001, ANN202
+    """按最长边把图片缩到 [min_side, max_side] 区间内（只做整数倍或等比缩放）。"""
+    w, h = image.size
+    longest = max(w, h)
+    if longest <= 0:
+        return image
+    if longest > max_side:
+        scale = max_side / longest
+    elif longest < min_side:
+        scale = min(2.0, min_side / longest)  # 最多放大 2 倍，放太大反而变糊
+    else:
+        return image
+    from PIL import Image
+
+    target = (max(1, int(w * scale)), max(1, int(h * scale)))
+    return image.resize(target, Image.LANCZOS)
+
