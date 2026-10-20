@@ -50,6 +50,23 @@ Copy-Item .env.example .env            # 按需改 MYSQL_PASSWORD / 端口
 启动顺序固定：配置自检 → 装载语料 → 预热（jieba 词典 + 三条查询）→ `/readyz` 置 200。
 装载期间 `/healthz` 仍是 200，`/readyz` 返回 503，负载均衡不会把冷启动请求打到用户脸上。
 
+### 3.2 命令行测试台（不启服务也能查）
+
+`qa_system/main.py` 是给调参与排障用的 CLI：不经过 HTTP，直接把 `FAQService` 拉起来问。
+
+```powershell
+.\.venv\Scripts\python.exe -m qa_system.main                      # 交互式，读 MySQL
+.\.venv\Scripts\python.exe -m qa_system.main --csv                # 不连库，读 datasets CSV
+.\.venv\Scripts\python.exe -m qa_system.main -q "勾股定理咋证明啊"  # 单条查询后退出
+.\.venv\Scripts\python.exe -m qa_system.main --csv --rank -q "什么是光合作用"
+```
+
+交互命令：`/stats`（语料与命中率）、`/rebuild`（重建索引）、`/rank <问题>`（只看分数与分差）、
+`/subject <学科>`（限定学科检索，`off` 取消）。
+
+`/rank` 是调阈值的主要工具：`/v1/faq/search` 只回最终结论，看不出"差多少分"，
+而 `FAQ_THRESHOLD` / `FAQ_MARGIN` 的判断完全取决于 top1 分数与 top1−top2 分差。
+
 ## 4. 验证
 
 ```powershell
