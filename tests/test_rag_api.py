@@ -101,7 +101,8 @@ def test_search_returns_citations_and_gate() -> None:
 
 
 def test_search_gate_rejects_ambiguous() -> None:
-    app = _make_app([_ev("p1", 0.6), _ev("p2", 0.59)])
+    # 跨文档分差不足 → 歧义拒答（同一文档多块是互相印证，不算歧义）
+    app = _make_app([_ev("docA:p1", 0.6), _ev("docB:p1", 0.59)])
     body = _call(app, "/v1/rag/search", params={"q": "二次函数"}).json()
     assert body["evidence"]["passed"] is False
     assert body["evidence"]["reason"] == "ambiguous"

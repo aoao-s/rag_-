@@ -1,4 +1,4 @@
-# rag_system（PR3）运行手册：切分 · 入库 · 检索
+﻿# rag_system（PR3）运行手册：切分 · 入库 · 检索
 
 知识库链路：**文件 → 加载 → 父/子块切分 → BGE-M3 稠密+稀疏 → Milvus → 混合检索 → 重排 → 证据门**。
 与 qa_system 的分工：FAQ 答"标准问法"，rag_system 答"要读材料才能答的问题"，两者由编排层按意图分流。
@@ -43,15 +43,25 @@ cd F:\heima\RAG\RAGpro_智能教育系统
 1. 仓库根有 `datasets/` 目录（项目方语料），Python 会把它当 namespace 包，`import datasets` 拿到的是目录而不是 HF 库 → 装了 `datasets` 包后由 site-packages 的正规包胜出，别删这个目录即可。
 2. 下载 torch 走公网很慢时用 `scripts/fetch_torch.ps1`（分段 curl + 断点重试 + 拼装校验），`scripts/fetch_wheel.py` 是备用下载器。
 
-### 1.1 换用 conda 环境 `edu_rag`
+### 1.1 换用 conda 环境 `ragpro`
 
-项目当前（2026-10-20 起）跑在 `F:\miniconda3\envs\edu_rag`（Python 3.10）上：torch 2.10 / transformers 4.45 / pymilvus 2.6.4 / FlagEmbedding 1.3.5 都已在里面，**不需要**再装 RAG 那几个大包。缺的是这 5 个：
+项目当前（2026-10-20 起）跑在 `F:\miniconda3\envs\ragpro`（Python 3.12.15）上，里面已经有
+torch 2.14.1+cpu、transformers 5.19、FlagEmbedding、pymilvus 3.0.2、python-docx 1.2、python-pptx 1.0.2、
+PyMuPDF 1.28.2、rapidocr-onnxruntime、DBUtils。缺的只有 3 个（已装）：
 
 ```powershell
-F:\miniconda3\envs\edu_rag\python.exe -m pip install pymupdf structlog prometheus-client DBUtils pytest
+F:\miniconda3\envs\ragpro\python.exe -m pip install structlog prometheus-client pytest
 ```
 
-`python-docx` / `python-pptx` / `rapidocr-onnxruntime` 该环境已有，不用重装。
+跑单测、入库、起服务都用这个解释器：
+
+```powershell
+$env:PYTHONPATH='.'
+F:\miniconda3\envs\ragpro\python.exe -m pytest
+F:\miniconda3\envs\ragpro\python.exe -m rag_system.ingest --defaults
+F:\miniconda3\envs\ragpro\python.exe main.py
+```
+
 
 模型权重放本地（默认指向旧项目目录，可用 `RAG_EMBED_MODEL_PATH` / `RAG_RERANKER_PATH` 指到别处）：
 
@@ -151,15 +161,16 @@ curl "http://127.0.0.1:8000/v1/rag/stats"
 | `RAG_PARENT_SIZE` / `RAG_CHILD_SIZE` | 1200 / 300 | 父块进 prompt，子块只被检索 |
 | `RAG_TOP_K` | 40 | 每路 ANN 召回数 |
 | `RAG_FINAL_N` | 6 | 进 prompt 的证据条数 |
-| `RAG_RERANK_ENABLED` | true | CPU 上建议 false（否则单查数秒） |
+| `RAG_RERANK_ENABLED` | `auto` | `auto` = 只在有 CUDA 时启用；CPU 上 40 条候选实测 **115 s**，必须走融合分 |
 | `RAG_RERANK_CANDIDATES` | 40 | 只重排前 N 条 |
 | `RAG_EVIDENCE_THRESHOLD` | 0.35 | 低于此分不生成 |
-| `RAG_EVIDENCE_MARGIN` | 0.03 | top1-top2 最小间隔，防"同题族"误答 |
+| `RAG_EVIDENCE_MARGIN` | 0.03 | top1 与**另一篇文档**最好证据的最小间隔（同文档多块算互相印证） |
 | `RAG_EMBED_BACKEND` | auto | `hash` 仅用于管线验证，检索质量无意义 |
 
 ## 6. 已知边界
 
-1. **重排必须上 GPU**：CPU 上 40 条候选 2–4 s，会打穿 1.2 s 首 token 预算；没有 GPU 就 `RAG_RERANK_ENABLED=false`，按融合分排序。
-2. **证据门阈值未按真实语料标定**：0.35/0.03 是起点，语料扩充后应用黄金集重标（同 FAQ 阈值流程）。
+1. **重排必须上 GPU**：CPU 上 40 条候选实测 **115 s**（bge-reranker-v2-m3），远超 1.2 s 首 token 预算；`RAG_RERANK_ENABLED=auto` 会在无 CUDA 时自动跳过并按融合分排序。
+2. **证据门阈值未按真实语料标定**：0.35/0.03 是起点。实测融合分（无重排）在同主题多份资料上跨文档间隔只有 0.01–0.02，会判 `ambiguous` 拒答；门槛必须用 `datasets/07_eval` 的 157 条黄金集标定（同 FAQ 阈值流程）。
 3. **MinerU 走云端**：断网环境需改本地 `magic-pdf` 部署，当前只做了云 API + 缓存。
 4. **未做索引版本化**：现在 `--recreate` 是全量重建，重建期间服务不可用；blue/green + alias 切换在 PR3 第二阶段。
+

@@ -1,4 +1,4 @@
-﻿# EduRAG-Pro 智能教育知识库系统
+# EduRAG-Pro 智能教育知识库系统
 
 > 项目代号：EduRAG-Pro 1.41　|　形态：**交付项目**（非演示 Demo）　|　硬件：**有 GPU**　|　状态：架构设计完成，待实现
 > 本文件是本仓库的"项目宪法"：给人和给 AI 编码助手共用。改动架构决策时，**先改本文件，再改代码**。
@@ -698,6 +698,7 @@ class LLMGateway:                                  # rag_system/core/llm_gateway
 
 | 故障 | 降级 |
 |---|---|
+| 无 CUDA（`RAG_RERANK_ENABLED=auto`） | 启动即跳过重排，按融合分排序；CPU 上 40 候选实测 115 s，不可上线 |
 | rerank 超时/GPU OOM | 用融合分排序（质量降级，不报错） |
 | Milvus 慢 | 减少路数（只 dense），k 降到 20 |
 | 检索为空 | 一次 `DIRECT` 重试 → 仍空则兜底话术 + 转人工 |
@@ -742,6 +743,8 @@ class LLMGateway:                                  # rag_system/core/llm_gateway
 - 结论：**CPU 只能用于功能验证，线上必须 GPU**（手册 §1 已写清换 cu121 wheel 的方式）
 
 **未做**：黄金集 Recall/MRR 基线；索引版本化与 alias 切换；GPU 下的重排延迟基线。
+
+**证据门改为跨文档比较（2026-10-20）**：原先 `margin` 取 top1−top2，但 top2 常是同一份教案的相邻父块，分数天然接近（实测 0.0006–0.02），top1 已经 0.99 仍判 `ambiguous`。现在 `rag_system/core/evidence_gate.py::evaluate` 只在"另一篇文档"里找竞争对手（doc key 取自 `parent_id` 的 `{doc_id}:p{n}` 前缀），同一文档多块视为互相印证；`n_docs` 统计的是文档数。`RAG_EVIDENCE_MARGIN=0.03` 仍待用 157 条黄金集标定（融合分跨文档间隔实测仅 0.01–0.02，会偏保守）。
 
 **加载器矩阵（第二批，2026-10-20）**：`.md/.txt/.markdown/.srt/.docx/.pptx/.pdf/.jpg/.jpeg/.png/.bmp/.webp` 全覆盖；PDF 解析器由 `RAG_PDF_PARSER=auto|mineru|local` 决定，`auto` 下云解析任何异常都退本地并打 `pdf_parser_fallback`（同时在 `meta` 里留 `parser_fallback`/`mineru_error`，不静默）；两条都失败时把两个原因一起抛。加载器单测 16 条（含 docx 标题+表格、pptx 形状顺序、本地 PDF 页标记与空 PDF、工厂分派与双失败信息）；全量 **100 passed**。
 
@@ -883,6 +886,7 @@ MemoryWriter.on_turn(user_id, sid, turn) -> None
 | 2026-10-20 | **日志改为人读行格式**：`base/log_messages.py` 事件→中文文案表；行格式 `时间.毫秒 [级别] [pid:线程] logger (文件:行): 文案`（与旧项目 Ragpro 对齐）；检索结果单行带 `[来源: Redis 缓存 / MySQL 索引]`，未命中补一行「转交 RAG 检索」；分 `LOG_LEVEL`（控制台）/`LOG_FILE_LEVEL`（文件）；`LOG_QUERY_TEXT` dev 置 `true` | 项目组 |
 | 2026-10-20 | **PR3 第一批（切分/入库/检索）**：`rag_system/` 新增 document_loaders（md/txt/docx/pptx/srt/pdf-MinerU）、text_splitters（父 1200/子 300 + 标题继承）、embedding（BGE-M3 稠密+稀疏，无 torch 时退 hash）、store（Milvus HNSW+稀疏倒排、hybrid_search、先删后写）、ingest（CLI + 流水线 + manifest）、core（retriever 父块合并去重/可选重排/证据门）；`scripts/smoke_rag.py` 冒烟；79 条单测全绿；hash 后端跑通 6 份教材 → 17 子块 → 检索全链路 | 项目组 |
 | 2026-10-20 | **PR3 第二批（检索接入服务）**：新增 `rag_system/api.py` 的 `/v1/rag/search`、`/v1/rag/stats`；`main.py` 启动期 `Container.load_rag()` 预加载 Milvus 句柄与向量化模型，失败只置 `rag=false`、`/readyz` 暴露 `rag/rag_docs/rag_reason`、`/metrics` 增 `edurag_rag_ready`/`edurag_rag_docs`；新增 `tests/test_rag_api.py` 5 条；单测 84 条全绿 | 项目组 |
+| 2026-10-20 | **证据门改跨文档比较**：`margin` 只在"另一篇文档"里比（同一文档多块算互相印证，原先 0.99 分也会被判 `ambiguous`）；`RAG_RERANK_ENABLED` 默认改 `auto`（CPU 上重排 40 条候选实测 **115 s**，无 CUDA 即跳过并打日志）；运行环境改用 conda **`ragpro`**；真实入库 15 文件 / 622 块，`/readyz` 返回 `rag=true rag_docs=622`；单测 101 条全绿 | 项目组 |
 | 2026-10-20 | **PR3 真 BGE-M3 端到端跑通（CPU）**：离线分段拼装 torch 2.5.1+cpu；锁定 transformers 4.44.2 / sentencepiece **0.2.0**（0.2.2 在 Windows cp312 上 import 即崩）/ datasets 2.21.0 / huggingface-hub 0.36.2 / peft 0.12.0 / pymilvus 2.4.9 + `setuptools<81` + `marshmallow 3.22`；14 份文档 → 110 子块入库 82 s；`/v1/rag/search` top1 0.9794 命中原文、evidence 通过；实测重排 40 候选 CPU 约 4.5 s（`rerank=false` 599 ms）；`requirements.txt` 补 RAG 段、`.gitignore` 忽略 `rag_system/models/` | 项目组 |
 | 2026-10-20 | **PR3 第三种：加载器矩阵补齐**（参考旧项目 `Ragpro/rag_system/document_loaders`）：新增 `ocr.py`（rapidocr 进程内单例，paddle 优先、onnxruntime 兜底）、`loader_office.py`（docx/pptx 按文档流顺序、标题样式转 Markdown、表格转 Markdown 表格、内嵌图 OCR 可选）、`loader_image.py`（图片 OCR，失败抛错不返回空串）、`loader_pdf_local.py`（PyMuPDF 逐页 + 大图/扫描页 OCR + `<!-- page: n -->` 页标记）；工厂支持 12 种后缀，PDF 增 `RAG_PDF_PARSER=auto|mineru|local` 与云→本地自动降级（打 `pdf_parser_fallback`、meta 留痕）；新增 16 条加载器单测，全量 100 passed | 项目组 |
 

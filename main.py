@@ -1,4 +1,4 @@
-"""EduRAG-Pro 应用入口（对标旧项目根目录的 main.py）。
+﻿"""EduRAG-Pro 应用入口（对标旧项目根目录的 main.py）。
 
 职责：
 1. 建 FastAPI 应用并挂载三个模块的路由（当前只有 qa_system，rag_system / 记忆模块按 PR 逐步接入）；
@@ -179,14 +179,14 @@ class Container:
                     min_docs=s.rag_evidence_min_docs,
                 ),
                 "embedder_name": getattr(embedder, "name", "unknown"),
-                "rerank_enabled": s.rag_rerank_enabled,
+                "rerank_enabled": s.rerank_enabled,
                 "docs": docs,
             }
             log.info(
                 "rag_ready",
                 docs=docs,
                 embedder=getattr(embedder, "name", "unknown"),
-                rerank=s.rag_rerank_enabled,
+                rerank=s.rerank_enabled,
                 collection=s.milvus_collection,
             )
         except Exception as exc:  # noqa: BLE001 - Milvus/模型不可用时降级为"仅 FAQ"
@@ -378,4 +378,5 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
+
 

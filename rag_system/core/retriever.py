@@ -117,7 +117,7 @@ class Retriever:
         s = self.settings
         top_k = top_k or s.rag_top_k
         final_n = final_n or s.rag_final_n
-        use_rerank = s.rag_rerank_enabled if rerank is None else rerank
+        use_rerank = s.rerank_enabled if rerank is None else rerank
         result = RetrievalResult(query=query)
 
         dense, sparse = await asyncio.to_thread(self.embedder.encode_query, query)

@@ -100,8 +100,8 @@ class Settings(BaseSettings):
     rag_top_k: int = Field(default=40, alias="RAG_TOP_K")
     # 最终进 prompt 的父块数（证据条数）
     rag_final_n: int = Field(default=6, alias="RAG_FINAL_N")
-    # CPU 上没有 GPU 重排可用时关掉，按融合分排序
-    rag_rerank_enabled: bool = Field(default=True, alias="RAG_RERANK_ENABLED")
+    # 重排开关：auto=只在有 CUDA 时启用（CPU 上重排 40 条要上百秒，见 2026-10-20 实测）
+    rag_rerank_enabled: str = Field(default="auto", alias="RAG_RERANK_ENABLED")
     # 只对前 N 条候选重排：CPU 上重排 80 条要数秒，GPU 上 200ms 内可跑完 40 条
     rag_rerank_candidates: int = Field(default=40, alias="RAG_RERANK_CANDIDATES")
     # 送入重排的父块截断字符数，约等于 512 token
@@ -177,6 +177,21 @@ class Settings(BaseSettings):
         return (BASE_DIR / self.mineru_cache_dir).resolve()
 
     @property
+    def rerank_enabled(self) -> bool:
+        """把 `RAG_RERANK_ENABLED=auto|true|false` 解析成布尔。
+
+        默认 auto：**只有 CUDA 可用时才开重排**。实测 CPU 上 40 条候选要 115 s
+        （bge-reranker-v2-m3），比整条链路其它步骤加起来还慢两个数量级，
+        对在线请求不可接受；关掉后按融合分排序，质量降一点但 1–4 s 内返回。
+        """
+        value = str(self.rag_rerank_enabled).strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+        return _cuda_available()
+
+    @property
     def intent_labels(self) -> tuple[str, ...]:
         return INTENT_LABELS
 
@@ -201,5 +216,17 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+@lru_cache(maxsize=1)
+def _cuda_available() -> bool:
+    """是否有可用 CUDA。torch 没装或 CUDA 运行时缺失都按 False 处理（不抛错）。"""
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:  # pragma: no cover - 环境相关
+        return False
+
 
 

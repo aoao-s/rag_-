@@ -19,7 +19,7 @@ def _settings(tmp_path: Path, **kw) -> Settings:
         milvus_uri="http://127.0.0.1:19531",
         rag_top_k=10,
         rag_final_n=3,
-        rag_rerank_enabled=True,
+        rag_rerank_enabled="true",
         rag_rerank_candidates=5,
         rag_rerank_chars=100,
         rag_reranker_path=str(tmp_path / "nope"),
@@ -157,25 +157,42 @@ def test_gate_single_weak_evidence() -> None:
     assert d.passed is False and d.reason == "single_weak_evidence"
 
 
-def test_gate_ambiguous_when_two_close() -> None:
-    from rag_system.core.retriever import Evidence, RetrievalResult
+def _evidence(pid: str, score: float, source: str = "f") -> "Evidence":
+    from rag_system.core.retriever import Evidence
+
+    return Evidence(pid, "t", score, None, [], "t", source, "数学", "textbook", "", 0)
+
+
+def test_gate_same_doc_chunks_are_corroboration() -> None:
+    """同一篇文档的多块证据分数接近不算歧义——它们是互相印证。"""
+    from rag_system.core.retriever import RetrievalResult
 
     res = RetrievalResult(query="q")
-    res.evidences = [
-        Evidence("p1", "t", 0.60, None, [], "t", "f", "数学", "textbook", "", 0),
-        Evidence("p2", "t", 0.59, None, [], "t", "f", "数学", "textbook", "", 0),
-    ]
+    res.evidences = [_evidence("docA:p1", 0.99), _evidence("docA:p2", 0.9888), _evidence("docA:p3", 0.97)]
+    d = evidence_gate.evaluate(res, threshold=0.35, margin=0.03)
+    assert d.passed is True and d.reason == "ok"
+    assert d.n_docs == 1
+
+
+def test_gate_ambiguous_when_two_docs_close() -> None:
+    """跨文档分差不足才是歧义：两篇资料给出同样可信的答案。"""
+    from rag_system.core.retriever import RetrievalResult
+
+    res = RetrievalResult(query="q")
+    res.evidences = [_evidence("docA:p1", 0.60), _evidence("docA:p2", 0.585), _evidence("docB:p1", 0.59)]
     d = evidence_gate.evaluate(res, threshold=0.35, margin=0.03)
     assert d.passed is False and d.reason == "ambiguous"
+    assert abs(d.margin - 0.01) < 1e-9
+    assert d.n_docs == 2
 
 
 def test_gate_passes_with_clear_winner() -> None:
-    from rag_system.core.retriever import Evidence, RetrievalResult
+    from rag_system.core.retriever import RetrievalResult
 
     res = RetrievalResult(query="q")
-    res.evidences = [
-        Evidence("p1", "t", 0.80, None, [], "t", "f", "数学", "textbook", "", 0),
-        Evidence("p2", "t", 0.40, None, [], "t", "f", "数学", "textbook", "", 0),
-    ]
+    res.evidences = [_evidence("docA:p1", 0.80), _evidence("docB:p1", 0.40)]
     d = evidence_gate.evaluate(res, threshold=0.35, margin=0.03)
     assert d.passed is True and d.reason == "ok"
+    assert d.n_docs == 2
+
+

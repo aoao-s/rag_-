@@ -1,4 +1,4 @@
-"""rag_system 冒烟：入库少量文件 → 检索 → 证据门，全程打印可核对的信息。
+﻿"""rag_system 冒烟：入库少量文件 → 检索 → 证据门，全程打印可核对的信息。
 
 用法（先用 hash 后端验证管线，再用真模型验证质量）：
 
@@ -72,7 +72,7 @@ async def _main() -> int:
     queries = args.query or ["顶点式怎么写", "勾股定理的证明方法"]
     failures = 0
     for q in queries:
-        res = await retriever.search(q, rerank=settings.rag_rerank_enabled)
+        res = await retriever.search(q, rerank=settings.rerank_enabled)
         decision = evidence_gate.evaluate(
             res,
             threshold=settings.rag_evidence_threshold,
@@ -96,3 +96,4 @@ async def _main() -> int:
 if __name__ == "__main__":
     configure(get_settings().log_level, log_path=get_settings().log_path)
     sys.exit(asyncio.run(_main()))
+
