@@ -870,3 +870,4 @@ MemoryWriter.on_turn(user_id, sid, turn) -> None
 
 
 
+| 2026-10-20 | **PR3 第一批（切分/入库/检索）**：`rag_system/` 新增 document_loaders（md/txt/docx/pptx/srt/pdf-MinerU）、text_splitters（父 1200/子 300 + 标题继承）、embedding（BGE-M3 稠密+稀疏，无 torch 时退 hash）、store（Milvus HNSW+稀疏倒排、hybrid_search、先删后写）、ingest（CLI + 流水线 + manifest）、core（retriever 父块合并去重/可选重排/证据门）；`scripts/smoke_rag.py` 冒烟；79 条单测全绿；hash 后端跑通 6 份教材 → 17 子块 → 检索全链路 | 项目组 |
