@@ -11,7 +11,7 @@
 |---|---|---|
 | `MYSQL_PORT` | 3307 | 宿主机端口，刻意避开 3306（旧项目 rag-pro 的容器占着） |
 | `MYSQL_PASSWORD` | 637456 | root 密码，容器与应用共用 |
-| `MYSQL_DATABASE` | RAG_abc | 启动时自动建库 |
+| `MYSQL_DATABASE` | rag_sbc | 启动时自动建库 |
 | `REDIS_PORT` | 6380 | 宿主机端口，避开 6379 |
 | `REDIS_PASSWORD` | 1234 | `--requirepass`，应用必须一致 |
 

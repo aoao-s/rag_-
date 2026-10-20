@@ -153,7 +153,7 @@ RAGpro_智能教育系统/
 | 变量 | 说明 |
 |---|---|
 | `APP_ENV` / `APP_VERSION` | `dev` / `staging` / `prod`；版本号用于日志与灰度 |
-| `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE` | MySQL 连接；**同时也是 compose 的启动参数**，默认 3307/RAG_abc |
+| `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE` | MySQL 连接；**同时也是 compose 的启动参数**，默认 3307/rag_sbc |
 | `REDIS_HOST/PORT/PASSWORD/DB` | Redis 连接（compose 的 `requirepass` 取同一个 `REDIS_PASSWORD`），默认 6380 |
 | `FAQ_THRESHOLD` / `FAQ_MARGIN` | FAQ 命中绝对分与领先幅度；已标定为 0.25 / 0.10，改 `FAQ_NORM_K` 必须重标 |
 | `FAQ_CORPUS_CSV` | 无库模式：从该 CSV 装载 FAQ 语料；生产留空（MySQL 是真相源） |
