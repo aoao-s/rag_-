@@ -168,14 +168,15 @@ curl "http://127.0.0.1:8000/v1/rag/stats"
 | `RAG_FINAL_N` | 6 | 进 prompt 的证据条数 |
 | `RAG_RERANK_ENABLED` | `auto` | `auto` = 只在有 CUDA 时启用；CPU 上 40 条候选实测 **115 s**，必须走融合分 |
 | `RAG_RERANK_CANDIDATES` | 40 | 只重排前 N 条 |
-| `RAG_EVIDENCE_THRESHOLD` | 0.35 | 低于此分不生成 |
-| `RAG_EVIDENCE_MARGIN` | 0.03 | top1 与**另一篇文档**最好证据的最小间隔（同文档多块算互相印证） |
+| `RAG_EVIDENCE_THRESHOLD` | 0.74 | 低于此分不生成（黄金集标定） |
+| `RAG_EVIDENCE_MARGIN` | 0.01 | top1 与**另一篇文档**最好证据的最小间隔（同文档多块算互相印证） |
+| `RAG_EVIDENCE_QCOV` | 0.20 | 问句实词在 top1 证据里的最低覆盖率，挡"同主题不同知识点" |
 | `RAG_EMBED_BACKEND` | auto | `hash` 仅用于管线验证，检索质量无意义 |
 
 ## 6. 已知边界
 
 1. **重排必须上 GPU**：CPU 上 40 条候选实测 **115 s**（bge-reranker-v2-m3），远超 1.2 s 首 token 预算；`RAG_RERANK_ENABLED=auto` 会在无 CUDA 时自动跳过并按融合分排序。
-2. **证据门阈值未按真实语料标定**：0.35/0.03 是起点。实测融合分（无重排）在同主题多份资料上跨文档间隔只有 0.01–0.02，会判 `ambiguous` 拒答；门槛必须用 `datasets/07_eval` 的 157 条黄金集标定（同 FAQ 阈值流程）。
+2. **证据门已标定，但语料是瓶颈**：`datasets/07_eval` 1000 条里 763 条可判定，其中只有 **20%** 能在当前语料里召回到正确文档（黄金集覆盖 7–9 年级，库里只有 1 本九年级数学 + 6 份短教材）。取舍点 0.74/0.01/0.20 是"误放行 ≤5%"口径下可答放行 34%；要提升覆盖率得先补语料，不是调阈值。复跑：`python scripts/eval_rag.py analyze` / `calibrate`（报告 `docs/analysis/rag_threshold_report.md`）。
 3. **MinerU 走云端**：断网环境需改本地 `magic-pdf` 部署，当前只做了云 API + 缓存。
 4. **未做索引版本化**：现在 `--recreate` 是全量重建，重建期间服务不可用；blue/green + alias 切换在 PR3 第二阶段。
 

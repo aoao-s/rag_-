@@ -1,4 +1,4 @@
-# EduRAG-Pro 智能教育知识库系统
+﻿# EduRAG-Pro 智能教育知识库系统
 
 > 项目代号：EduRAG-Pro 1.41　|　形态：**交付项目**（非演示 Demo）　|　硬件：**有 GPU**　|　状态：架构设计完成，待实现
 > 本文件是本仓库的"项目宪法"：给人和给 AI 编码助手共用。改动架构决策时，**先改本文件，再改代码**。
@@ -220,7 +220,7 @@ RAGpro_智能教育系统/
 2. 父子块：子块命中 → 按 `parent_id` 去重 → 回填 `parent_content`，命中片段用 `<精准检索定位区块>` 包裹（保留旧项目的这份资产）。
 3. 标量过滤：`tenant_id`、`acl_tags`、`subject`、`kb_version` 强制前置过滤，**不允许"先检索再过滤"**。
 4. 重排：GPU 批量，输入截断 512 token（保留高亮邻域），`top_n=8`；再按 token 预算裁到 4–6 个父块。
-5. 证据门：`max(rerank_score) < EVIDENCE_THRESHOLD` 或实体覆盖不足 → 不生成。
+5. 证据门（四条并列，任一不过就不生成）：① `top1 融合分 < EVIDENCE_THRESHOLD`；② 与**另一篇文档**最好证据的分差 `< EVIDENCE_MARGIN`（同文档多块算互相印证）；③ 只有 1 块孤证时要求 `top1 ≥ 阈值 + 0.10`；④ 问句实词在 top1 证据里的覆盖率 `< EVIDENCE_QCOV`（挡"同主题不同知识点"）。默认 0.74 / 0.01 / 0.20 由黄金集 763 条标定，取舍为误放行 ≤5%。
 6. **验收**：单次检索（含重排）p95 ≤ 170 ms（GPU）；黄金集 Recall@10 ≥ 0.90。
 
 ### 3.4 生成与引用（P0）
@@ -464,7 +464,7 @@ async def retrieve_node(state: ChatState, ctx: Ctx) -> ChatState:
 | `PARENT_CHUNK_SIZE / OVERLAP` | 1200 / 100 | 父块 |
 | `CHILD_CHUNK_SIZE / OVERLAP` | 300 / 20 | 子块 |
 | 融合权重 | dense 0.7 / sparse 0.3 | 或改 RRF |
-| `EVIDENCE_THRESHOLD` | 0.35（待标定） | 证据门 |
+| `EVIDENCE_THRESHOLD / MARGIN / QCOV` | 0.74 / 0.01 / 0.20（已标定） | 证据门三判据（分数 / 跨文档分差 / 问题词覆盖） |
 | 语义缓存阈值 | 0.95 | 低于此不开 |
 | 缓存 TTL | 精确 24 h / 语义 24 h | 随 `kb_version` 失效 |
 | 会话窗口 | 40 轮 / 28 000 token（先到先压） | Redis LIST + 压缩任务 |
@@ -744,7 +744,9 @@ class LLMGateway:                                  # rag_system/core/llm_gateway
 
 **未做**：黄金集 Recall/MRR 基线；索引版本化与 alias 切换；GPU 下的重排延迟基线。
 
-**证据门改为跨文档比较（2026-10-20）**：原先 `margin` 取 top1−top2，但 top2 常是同一份教案的相邻父块，分数天然接近（实测 0.0006–0.02），top1 已经 0.99 仍判 `ambiguous`。现在 `rag_system/core/evidence_gate.py::evaluate` 只在"另一篇文档"里找竞争对手（doc key 取自 `parent_id` 的 `{doc_id}:p{n}` 前缀），同一文档多块视为互相印证；`n_docs` 统计的是文档数。`RAG_EVIDENCE_MARGIN=0.03` 仍待用 157 条黄金集标定（融合分跨文档间隔实测仅 0.01–0.02，会偏保守）。
+**证据门改为跨文档比较（2026-10-20）**：原先 `margin` 取 top1−top2，但 top2 常是同一份教案的相邻父块，分数天然接近（实测 0.0006–0.02），top1 已经 0.99 仍判 `ambiguous`。现在 `rag_system/core/evidence_gate.py::evaluate` 只在"另一篇文档"里找竞争对手（doc key 取自 `parent_id` 的 `{doc_id}:p{n}` 前缀），同一文档多块视为互相印证；`n_docs` 统计的是文档数。
+
+**证据门标定完成（2026-10-20，commit 92e4c1f）**：`datasets/07_eval/ragas_eval.jsonl` 是 **1000 条**（不是预估的 157），`scripts/eval_rag.py` 建 763 条可判定样本（去掉跨学科冲突与空证据），跑检索并解出两条判据：① 分数门槛做不了"同题族"区分——可答与不可答的 top1 中位数只差 0.04（0.782 vs 0.744），且 58% 不可答题分数高于 0.70；② **问题词覆盖率（qcov）** 是更强的独立信号（可答中位 0.6 vs 不可答 0.2）。据此给 `evaluate()` 加第四条判据 `min_qcov` 并新增 `query_coverage()`，标定取「误放行 ≤5%」的取舍点 **threshold=0.74 / margin=0.01 / qcov=0.20 → 可答放行 34%、不可答误放 3%**（放松到 0.72 则 50%/9%）。根因不在门槛而在语料：黄金集覆盖 7–9 年级，库里只有 1 本九年级数学 + 6 份短教材，可答题里只有 20% 能召回到正确文档。报告 `docs/analysis/rag_threshold_report.md`，原始跑批 `docs/analysis/rag_eval_runs.jsonl`（可复跑重标定）（763 行，含每题 top-10 证据与 qcov）。
 
 **加载器矩阵（第二批，2026-10-20）**：`.md/.txt/.markdown/.srt/.docx/.pptx/.pdf/.jpg/.jpeg/.png/.bmp/.webp` 全覆盖；PDF 解析器由 `RAG_PDF_PARSER=auto|mineru|local` 决定，`auto` 下云解析任何异常都退本地并打 `pdf_parser_fallback`（同时在 `meta` 里留 `parser_fallback`/`mineru_error`，不静默）；两条都失败时把两个原因一起抛。加载器单测 16 条（含 docx 标题+表格、pptx 形状顺序、本地 PDF 页标记与空 PDF、工厂分派与双失败信息）；全量 **100 passed**。
 
@@ -890,3 +892,4 @@ MemoryWriter.on_turn(user_id, sid, turn) -> None
 | 2026-10-20 | **PR3 真 BGE-M3 端到端跑通（CPU）**：离线分段拼装 torch 2.5.1+cpu；锁定 transformers 4.44.2 / sentencepiece **0.2.0**（0.2.2 在 Windows cp312 上 import 即崩）/ datasets 2.21.0 / huggingface-hub 0.36.2 / peft 0.12.0 / pymilvus 2.4.9 + `setuptools<81` + `marshmallow 3.22`；14 份文档 → 110 子块入库 82 s；`/v1/rag/search` top1 0.9794 命中原文、evidence 通过；实测重排 40 候选 CPU 约 4.5 s（`rerank=false` 599 ms）；`requirements.txt` 补 RAG 段、`.gitignore` 忽略 `rag_system/models/` | 项目组 |
 | 2026-10-20 | **PR3 第三种：加载器矩阵补齐**（参考旧项目 `Ragpro/rag_system/document_loaders`）：新增 `ocr.py`（rapidocr 进程内单例，paddle 优先、onnxruntime 兜底）、`loader_office.py`（docx/pptx 按文档流顺序、标题样式转 Markdown、表格转 Markdown 表格、内嵌图 OCR 可选）、`loader_image.py`（图片 OCR，失败抛错不返回空串）、`loader_pdf_local.py`（PyMuPDF 逐页 + 大图/扫描页 OCR + `<!-- page: n -->` 页标记）；工厂支持 12 种后缀，PDF 增 `RAG_PDF_PARSER=auto|mineru|local` 与云→本地自动降级（打 `pdf_parser_fallback`、meta 留痕）；新增 16 条加载器单测，全量 100 passed | 项目组 |
 
+| 2026-10-20 | **RAG 证据门标定完成**：`scripts/eval_rag.py` 用 `datasets/07_eval` 1000 条黄金集建 763 条可判定样本，解出阈值/margin/qcov 三条判据的取舍点；`evidence_gate.py` 新增 `query_coverage()` 第四条判据（问句实词覆盖，挡"同主题不同知识点"）；默认值改 **0.74 / 0.01 / 0.20**（可答放行 34%、不可答误放 3%，误放 ≤5% 口径）；763 题跑批 9.6 min；单测 104 条全绿 | 项目组 |

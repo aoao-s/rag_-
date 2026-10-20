@@ -113,9 +113,15 @@ class Settings(BaseSettings):
     # 重排模型用 fp16 需要 GPU；CPU 上 fp16 会直接报错
     rag_use_fp16: bool = Field(default=True, alias="RAG_USE_FP16")
     # 证据门（CLAUDE.md §7.2.1 第⑥步）：低于门槛不生成，宁可转人工
-    rag_evidence_threshold: float = Field(default=0.35, alias="RAG_EVIDENCE_THRESHOLD")
-    rag_evidence_margin: float = Field(default=0.03, alias="RAG_EVIDENCE_MARGIN")
+    # 默认值来自 2026-10-20 黄金集标定（datasets/07_eval 763 条可判定样本），
+    # 取舍点为「误放行 ≤5%」：0.74 / 0.01 / 0.20 → 可答题放行 34%，不可答题误放 3%。
+    # 想多答就放松到 0.72，想更稳就收紧到 0.76（见 docs/analysis/rag_threshold_report.md）。
+    rag_evidence_threshold: float = Field(default=0.74, alias="RAG_EVIDENCE_THRESHOLD")
+    # 跨文档分差（同文档多块不算歧义）；0 = 关闭歧义判定
+    rag_evidence_margin: float = Field(default=0.01, alias="RAG_EVIDENCE_MARGIN")
     rag_evidence_min_docs: int = Field(default=1, alias="RAG_EVIDENCE_MIN_DOCS")
+    # 问句实词在 top1 证据里的最低覆盖率：挡"同主题但没答这个问题"的块
+    rag_evidence_qcov: float = Field(default=0.20, alias="RAG_EVIDENCE_QCOV")
 
     # ---- 向量库 Milvus（CLAUDE.md §8.1）----
     milvus_uri: str = Field(default="http://127.0.0.1:19531", alias="MILVUS_URI")

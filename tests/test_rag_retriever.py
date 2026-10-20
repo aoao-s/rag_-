@@ -196,3 +196,42 @@ def test_gate_passes_with_clear_winner() -> None:
     assert d.n_docs == 2
 
 
+def _text_evidence(pid: str, score: float, text: str) -> "Evidence":
+    from rag_system.core.retriever import Evidence
+
+    return Evidence(pid, text, score, None, [], text, "f", "数学", "textbook", "", 0)
+
+
+def test_gate_rejects_when_question_words_absent() -> None:
+    """分数很高但证据里没有问句实词——典型"同主题不同知识点"，必须拒答。"""
+    from rag_system.core.retriever import RetrievalResult
+
+    res = RetrievalResult(query="有理数的加法法则是什么")
+    res.evidences = [
+        _text_evidence("docA:p1", 0.92, "教案：板书设计要突出二次函数顶点式的推导过程"),
+        _text_evidence("docB:p1", 0.50, "课后作业：一元二次方程求根练习"),
+    ]
+    d = evidence_gate.evaluate(res, threshold=0.74, margin=0.01, min_qcov=0.20)
+    assert d.passed is False and d.reason == "low_query_coverage"
+    assert d.qcov == 0.0
+
+
+def test_gate_passes_when_question_covered() -> None:
+    from rag_system.core.retriever import RetrievalResult
+
+    res = RetrievalResult(query="勾股定理的证明方法")
+    res.evidences = [
+        _text_evidence("docA:p1", 0.92, "勾股定理的证明方法有很多种，常见的是赵爽弦图证明。"),
+        _text_evidence("docB:p1", 0.50, "光合作用需要光照。"),
+    ]
+    d = evidence_gate.evaluate(res, threshold=0.74, margin=0.01, min_qcov=0.20)
+    assert d.passed is True and d.reason == "ok"
+    assert d.qcov >= 0.5
+
+
+def test_query_coverage_no_content_words() -> None:
+    """问句全是虚词时覆盖度判不了，返回 1.0 而不是把用户挡在门外。"""
+    assert evidence_gate.query_coverage("怎么办", "随便一段话") == 1.0
+    assert evidence_gate.query_coverage("勾股定理怎么证明", "勾股定理的证明方法") > 0.3
+
+

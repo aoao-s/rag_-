@@ -1,4 +1,4 @@
-﻿"""EduRAG-Pro 应用入口（对标旧项目根目录的 main.py）。
+"""EduRAG-Pro 应用入口（对标旧项目根目录的 main.py）。
 
 职责：
 1. 建 FastAPI 应用并挂载三个模块的路由（当前只有 qa_system，rag_system / 记忆模块按 PR 逐步接入）；
@@ -177,6 +177,7 @@ class Container:
                     threshold=s.rag_evidence_threshold,
                     margin=s.rag_evidence_margin,
                     min_docs=s.rag_evidence_min_docs,
+                    min_qcov=s.rag_evidence_qcov,
                 ),
                 "embedder_name": getattr(embedder, "name", "unknown"),
                 "rerank_enabled": s.rerank_enabled,

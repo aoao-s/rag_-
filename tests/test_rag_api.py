@@ -66,7 +66,8 @@ def _make_app(evidences: list[Evidence], ready: bool = True) -> FastAPI:
             "ready": True,
             "reason": "ok",
             "retriever": retriever,
-            "gate": lambda r: gate_evaluate(r, threshold=0.35, margin=0.03),
+            # 假门的重点在"接口把门的结论透出去"；问题词覆盖度由 test_rag_retriever 单独验证
+            "gate": lambda r: gate_evaluate(r, threshold=0.35, margin=0.03, min_qcov=0.0),
             "embedder_name": "fake",
             "rerank_enabled": False,
             "docs": 3,
