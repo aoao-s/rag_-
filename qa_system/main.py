@@ -54,6 +54,10 @@ REASON_ZH = {
     "not_loaded": "未命中：语料未装载",
 }
 
+# 命中来源必须显示：同一句问两遍，第一遍走索引、第二遍走缓存，耗时差一个量级，
+# 不标出来会让人误以为"服务忽快忽慢"。
+SOURCE_ZH = {"cache": "Redis 缓存", "index": "MySQL 索引", "rag": "RAG 检索", "none": "无"}
+
 BANNER = """\
 ================================================================
  EduRAG-Pro · qa_system 查询测试台
@@ -110,12 +114,41 @@ async def build_service(*, use_csv: bool, limit: int | None) -> FAQService:
         repository = MySQLFAQRepository(mysql)
         print(f"[i] 语料来源：MySQL {settings.mysql_host}:{settings.mysql_port}/{settings.mysql_database}")
 
+    # 与 API 用同一套 Redis 二级缓存：CLI 里连问同一句两次，第二次就会显示「来源：Redis 缓存」，
+    # 这是验证续命/回填逻辑最直接的方式。Redis 不可用时退化为进程内缓存，不影响查询。
+    faq_cache = None
+    if settings.faq_cache_enabled:
+        from base.logger import get_logger as _get_logger
+
+        try:
+            from qa_system.res.qa_cache import RedisFAQCache, create_redis
+
+            redis_client = create_redis(settings)
+            redis_client.ping()
+            faq_cache = RedisFAQCache(
+                redis_client,
+                max_ttl=settings.faq_cache_max_ttl,
+                slide_ratio=settings.faq_cache_slide_ratio,
+            )
+            print(f"[i] 缓存：Redis {settings.redis_host}:{settings.redis_port}/{settings.redis_db}")
+        except Exception as exc:
+            from qa_system.res.qa_cache import InMemoryFAQCache
+
+            faq_cache = InMemoryFAQCache(max_ttl=settings.faq_cache_max_ttl)
+            _get_logger(__name__).warning("faq_cache_disabled", reason="redis_unavailable", detail=str(exc))
+            print(f"[!] Redis 不可用，退化为进程内缓存：{exc}")
+
     service = FAQService(
         repository,
         policy=policy,
         alias_enabled=settings.faq_alias_enabled,
         top_k=settings.faq_top_k,
         extra_words=settings.subjects,
+        cache=faq_cache,
+        cache_ttl=settings.faq_cache_ttl,
+        cache_negative_ttl=settings.faq_cache_negative_ttl,
+        cache_prefix=f"edurag:{settings.app_env}",
+        log_query=settings.log_query_text,
     )
     info = await service.load()
     await service.warmup()
@@ -123,12 +156,30 @@ async def build_service(*, use_csv: bool, limit: int | None) -> FAQService:
     return service
 
 
+def reason_text(reason: str) -> str:
+    """把 `cache_ok` 这类带前缀的原因翻译成人话（缓存命中时 reason 会多一层前缀）。"""
+    if reason.startswith("cache_"):
+        return REASON_ZH.get(reason[6:], reason[6:]) + "（结果直接取自缓存）"
+    return REASON_ZH.get(reason, reason)
+
+
 def print_hit(query: str, hit: FAQHit, subject: str | None) -> None:
     flag = "命中" if hit.hit else "未命中"
+    source = SOURCE_ZH.get(hit.source, hit.source or "未知")
+    cache_note = {
+        "hit": "缓存命中，未回源",
+        "miss": "缓存未命中，已回源",
+        "disabled": "缓存未启用",
+        "error": "缓存异常，已降级回源",
+    }.get(hit.cache, "")
     print()
     print(f"问题：{query}" + (f"   （限定学科：{subject}）" if subject else ""))
-    print(f"结论：{flag}   分数 {hit.score:.4f}   耗时 {hit.latency_ms:.2f} ms")
-    print(f"原因：{REASON_ZH.get(hit.reason, hit.reason)}")
+    print(
+        f"结论：{flag}   来源：{source}"
+        + (f"（{cache_note}）" if cache_note else "")
+        + f"   分数 {hit.score:.4f}   耗时 {hit.latency_ms:.2f} ms"
+    )
+    print(f"原因：{reason_text(hit.reason)}")
 
     if hit.hit:
         print(f"原问：{hit.matched_question}")
@@ -242,7 +293,17 @@ async def interactive(service: FAQService) -> None:
 
 async def main_async(args: argparse.Namespace) -> int:
     settings = get_settings()
-    configure(settings.log_level)
+    # CLI 与 API 写同一份 logs/app.log：在测试台里问的问题，事后能在日志里对上。
+    # 控制台只留 WARNING，避免业务日志把"问题/结论/答案"的阅读节奏打散——
+    # 命中来源已经由 print_hit 打在自己那一行里了。
+    configure(
+        settings.log_level,
+        console_level="WARNING",
+        log_path=settings.log_path,
+        max_bytes=settings.log_max_bytes,
+        backup_count=settings.log_backup_count,
+        file_level=settings.log_file_level,
+    )
     # jieba 自带 DEBUG 日志（"Building prefix dict…"），在测试台里只会干扰输出
     import logging
 
