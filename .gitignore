@@ -18,3 +18,7 @@ datasets/
 # 容器数据与离线镜像包（体积大，走移动硬盘/内网传输）
 docker/volumes/
 docker/offline/images/
+
+# IDE
+.idea/
+
