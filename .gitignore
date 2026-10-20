@@ -1,0 +1,16 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# 本地配置与日志
+.env
+logs/
+*.log
+
+# 数据与产物（datasets 由项目方提供，只读引用）
+docs/diagrams/*.png.bak
+
+# 项目方提供的语料（只读，不纳入版本管理）
+datasets/

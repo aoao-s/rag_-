@@ -1,0 +1,27 @@
+﻿# qa_system（PR1 地基 + PR2）运行时依赖
+# 装法：.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+# 版本为当前验证过的组合，升级前先跑 pytest 与 README 里的冒烟命令
+
+# ---- Web ----
+fastapi==0.146.0
+uvicorn[standard]==0.54.0
+
+# ---- 配置 / 观测 ----
+pydantic==2.14.1
+pydantic-settings==2.16.0
+python-dotenv==1.2.4
+structlog==26.1.0
+prometheus-client==0.26.0
+
+# ---- 存储 ----
+PyMySQL==1.2.3
+DBUtils==3.2.0
+redis==8.1.0
+
+# ---- 中文处理 ----
+jieba==0.42.1
+
+# ---- 测试 ----
+pytest==9.1.1
+httpx==0.28.1
+
