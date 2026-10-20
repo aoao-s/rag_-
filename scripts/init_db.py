@@ -1,4 +1,4 @@
-﻿"""初始化 MySQL 表结构（幂等）。
+"""初始化 MySQL 表结构（幂等）。
 
 用法：
     python scripts/init_db.py            # 建库建表，保留已有数据
@@ -179,7 +179,9 @@ def main() -> int:
                 )
                 log.warning("legacy_subjects_deprecated", rows=cur.rowcount)
             cur.execute("SHOW TABLES")
-            tables = sorted(row[f"Tables_in_{settings.mysql_database}"] for row in cur.fetchall())
+            # 列名大小写随库名/系统而定（`Tables_in_rag_abc` vs `Tables_in_RAG_abc`），
+            # 不能按库名拼 key，直接取每行第一个值。
+            tables = sorted(next(iter(row.values())) for row in cur.fetchall())
     finally:
         conn.close()
 

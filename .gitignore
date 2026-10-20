@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 .venv/
@@ -14,3 +14,7 @@ docs/diagrams/*.png.bak
 
 # 项目方提供的语料（只读，不纳入版本管理）
 datasets/
+
+# 容器数据与离线镜像包（体积大，走移动硬盘/内网传输）
+docker/volumes/
+docker/offline/images/

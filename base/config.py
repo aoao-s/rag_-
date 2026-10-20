@@ -20,7 +20,8 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
-
+    # ；alias 不改变来源。来源的优先级固定。
+    # alias 决定“在给定来源里找哪个键名”，不涉及优先级。
     # ---- 应用 ----
     app_env: str = Field(default="dev", alias="APP_ENV")
     app_version: str = Field(default="0.1.0", alias="APP_VERSION")
@@ -39,7 +40,7 @@ class Settings(BaseSettings):
     # ---- Redis ----
     redis_host: str = Field(default="127.0.0.1", alias="REDIS_HOST")
     redis_port: int = Field(default=6379, alias="REDIS_PORT")
-    redis_password: str = Field(default="", alias="REDIS_PASSWORD")
+    redis_password: str = Field(default="1234", alias="REDIS_PASSWORD")
     redis_db: int = Field(default=0, alias="REDIS_DB")
 
     # ---- qa_system 参数（CLAUDE.md §7.1.2）----

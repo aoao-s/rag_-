@@ -19,9 +19,12 @@ datasets/04_faq/edu_faq.csv
 cd F:\heima\RAG\RAGpro_智能教育系统
 F:\miniconda3\python.exe -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example .env      # 按需改 MYSQL_PASSWORD
-docker compose -f docker/docker-compose.yml up -d
+Copy-Item .env.example .env            # 按需改 MYSQL_PASSWORD / 端口
+.\scripts\docker_up.ps1                # 起 MySQL(3307) + Redis(6380)，等健康检查
 ```
+
+> 离线机器先跑 `.\docker\offline\load.ps1` 导入镜像，再跑上面最后一条。
+> 端口/密码只改 `.env`，compose 和应用读同一份，详见 `docs/docker-离线部署.md`。
 
 ## 2. 建表与导数据
 

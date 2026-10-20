@@ -278,11 +278,16 @@ class FAQService:
     # ------------------------------------------------------------------ 观测
     def state(self) -> dict[str, Any]:
         snapshot = self._snapshot
+        # 学科为空的行（数据集里有 97 条「认识自己」类问题没有标学科）单独计为 unlabeled，
+        # 不能 str(None) 混进 subjects，否则监控面板上会出现一个叫 "None" 的学科。
+        subjects = sorted(k for k in snapshot.indexes if k)
+        unlabeled = sum(len(snapshot.indexes[k]) for k in snapshot.indexes if not k)
         return {
             "loaded": snapshot.version > 0,
             "version": snapshot.version,
             "docs": snapshot.doc_count,
-            "subjects": sorted(str(k) for k in snapshot.indexes),
+            "subjects": subjects,
+            "unlabeled": unlabeled,
             "built_at": snapshot.built_at,
         }
 

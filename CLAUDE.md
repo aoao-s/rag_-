@@ -124,10 +124,12 @@ RAGpro_智能教育系统/
 ├─ rag_system/                        # 知识库检索与生成（PR3 待实现）
 │  └─ core/                           # rag_pipeline / retriever / reranker / evidence_gate / citation
 ├─ docker/
-│  ├─ docker-compose.yml              # etcd + minio + milvus + attu + redis + mysql
+│  ├─ docker-compose.yml              # mysql(3307) + redis(6380) + etcd/minio/milvus/attu；全部 pull_policy: never
+│  ├─ offline/                        # 离线镜像：save.ps1 导出 / load.ps1 导入 / images/*.tar（不入库）
 │  ├─ docker-compose.gpu.yml          # 待实现：应用 + 推理容器（CUDA 12.1）
-│  └─ Dockerfile                      # 待实现：多阶段构建，非 root 运行
-├─ scripts/                           # 建库建表、导入 FAQ、重建索引、压测
+│  ├─ Dockerfile                      # 待实现：多阶段构建，非 root 运行
+│  └─ volumes/                        # 容器数据（不入库；down -v 或 -Purge 才清）
+├─ scripts/                           # docker_up/down.ps1、建库建表、导入 FAQ、阈值标定、压测
 ├─ tests/                             # 单测、契约测试、降级演练
 ├─ datasets/                          # 项目方提供的语料（只读，不改不删）
 ├─ logs/                              # 运行日志（不入库）
@@ -151,8 +153,8 @@ RAGpro_智能教育系统/
 | 变量 | 说明 |
 |---|---|
 | `APP_ENV` / `APP_VERSION` | `dev` / `staging` / `prod`；版本号用于日志与灰度 |
-| `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE` | MySQL 连接 |
-| `REDIS_HOST/PORT/PASSWORD/DB` | Redis 连接（compose 里 `requirepass` 必须与此一致） |
+| `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE` | MySQL 连接；**同时也是 compose 的启动参数**，默认 3307/RAG_abc |
+| `REDIS_HOST/PORT/PASSWORD/DB` | Redis 连接（compose 的 `requirepass` 取同一个 `REDIS_PASSWORD`），默认 6380 |
 | `FAQ_THRESHOLD` / `FAQ_MARGIN` | FAQ 命中绝对分与领先幅度；已标定为 0.25 / 0.10，改 `FAQ_NORM_K` 必须重标 |
 | `FAQ_CORPUS_CSV` | 无库模式：从该 CSV 装载 FAQ 语料；生产留空（MySQL 是真相源） |
 | `MILVUS_HOST/PORT/DATABASE/COLLECTION` | Milvus 连接与集合名 |
@@ -276,24 +278,28 @@ QAF = Question–Answer–Feedback 闭环数据集；Tag 是贯穿路由、检�
 # 1) Python 3.12 虚拟环境
 py -3.12 -m venv .venv
 .venv\Scripts\activate            # Windows
-pip install -e ".[dev]"
+pip install -r requirements.txt
 
-# 2) 环境变量
+# 2) 环境变量（端口/账号只写这一份，compose 与 python 共用）
 copy .env.example .env            # 填入真实 key，禁止提交
 
-# 3) 基础设施（Milvus + etcd + MinIO + Attu + Redis + MySQL）
-docker compose -f docker/docker-compose.yml up -d
-docker compose -f docker/docker-compose.yml ps     # 等 milvus-standalone 变 healthy
+# 3) 数据面：MySQL + Redis（离线可用，镜像由 docker/offline/save.ps1 导出）
+powershell -File scripts/docker_up.ps1          # 起 mysql+redis 并等健康检查
+powershell -File scripts/docker_up.ps1 -Full    # 含 etcd/minio/milvus/attu（PR3）
+# 离线机器：先 docker/offline/load.ps1 导入镜像，再跑上面这条
 
 # 4) 建库建表 + 导入 FAQ + 建 collection
-python scripts/init_mysql.py
+python scripts/init_db.py
 python scripts/init_milvus.py --collection edurag_v1
-python scripts/import_faq.py --csv data/faq.csv
+python scripts/import_faq.py --csv datasets/04_faq/edu_faq.csv --publish
 python scripts/ingest.py --src data/docs --kb-version v1
 
 # 5) 启动（启动期加载模型，见 4.2）
 python main.py                     # 或 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
+端口基线：MySQL **3307**、Redis **6380**（刻意避开 3306/6379，本机旧项目容器占着），
+全部由 `.env` 的 `MYSQL_PORT` / `REDIS_PORT` 决定，详见 `docs/docker-离线部署.md`。
 
 ### 4.2 启动期的三件事（本项目的硬性要求）
 
@@ -593,10 +599,11 @@ class FAQService:                                   # qa_system/res/qa_search.py
 | 归一化 | 语气词/数字/别名 | 另加口语表（咋→怎么、啥→什么、甭→不用） | "勾股定理咋证明"因此能精确命中 |
 | 表结构 | faq / faq_alias / faq_feedback | 同左，`faq` 自动补列（旧库可平滑迁移） | `--prune-legacy-subjects` 一次性下线非 K12 历史行 |
 | 接口 | search/publish/deprecate/rebuild + healthz/readyz/metrics | 全部实现 | `X-Admin-Token` 保护写接口，未配置时仅本机调试 |
+| 数据面 | compose 起 mysql+redis | 独立端口 3307/6380，`pull_policy: never`，offline save/load 脚本 | 见 `docs/docker-离线部署.md` |
 
-代码位置：`base/{config,labels,contracts,logger,db}.py`（地基）、`qa_system/res/{qa_normalize,qa_corpus,qa_matcher,qa_db,qa_search}.py`（qa_system）、`qa_system/api.py` + `main.py`（HTTP）、`scripts/{init_db,import_faq}.py`、`tests/`（46 条用例）。
+代码位置：`base/{config,labels,contracts,logger,db}.py`（地基）、`qa_system/res/{qa_normalize,qa_corpus,qa_matcher,qa_db,qa_cache,qa_search,qa_csv}.py`（qa_system）、`qa_system/api.py` + `main.py`（HTTP）、`scripts/{init_db,import_faq,eval_faq,docker_up,docker_down}.py|ps1`、`tests/`（46 条用例）。
 
-实测：160 条 K12 FAQ；服务端 `search` 平均 0.3 ms；端到端（keep-alive）p50 5.7 ms / p95 9.1 ms。
+实测：**2000 条** K12 FAQ（`datasets/04_faq/edu_faq.csv` 已扩充，其中 97 条无学科，`state()` 单列 `unlabeled` 计数，不混进 `subjects`）；服务端 `search` 平均 0.3 ms；端到端（keep-alive）p50 5.7 ms / p95 9.1 ms（160 条语料时测得）。
 `FAQ_THRESHOLD` 已标定：`scripts/eval_faq.py` 用 deepseek-flash 为 160 条 FAQ 生成 480 条同义问法（+80 条题库负样本），二维扫描后取 **threshold=0.25 + margin=0.10**（召回 0.637 / 精度 0.950）。分数尺度依赖 `FAQ_NORM_K=12`，改 K 必须重跑标定；线上真实流量积累 2 周后要用真实点击重标。
 
 ---
@@ -803,6 +810,7 @@ MemoryWriter.on_turn(user_id, sid, turn) -> None
 | 2026-10-20 | 实现层三处收敛并写回 §7.1.6：别名只做整串等价、热更新先全量重建（>5 万条再上事件流）、归一化加口语同义词表 | 项目组 |
 | 2026-10-20 | **FAQ 阈值标定完成**：`scripts/eval_faq.py`（gen 480 条同义问法 + calibrate 二维扫描），报告 `docs/analysis/faq_threshold_report.md`；定 `FAQ_THRESHOLD=0.25`、`FAQ_MARGIN=0.10`（precision 0.950 / recall 0.637），`MatchPolicy` 与 `.env` 同步 | 项目组 |
 | 2026-10-20 | 新增无库模式：`FAQ_CORPUS_CSV` 从 CSV 装载语料（`qa_system/res/qa_csv.py` 与 `scripts/eval_faq.py` 共用），MySQL 仍为生产真相源 | 项目组 |
+| 2026-10-20 | **离线数据面落地**：`docker/docker-compose.yml` 端口/账号全部取自 `.env`（MySQL 3307 / Redis 6380，避开旧项目占用的 3306/6379），每个服务 `pull_policy: never`；`docker/offline/{save,load}.ps1` 导出/导入镜像（mysql 237 MB + redis 55 MB）；`scripts/{docker_up,docker_down}.ps1` 封装 `--env-file` 与健康等待；文档 `docs/docker-离线部署.md`。实测 MySQL 8.0.46 + Redis 健康，2000 条 FAQ 入库 | 项目组 |
 
 
 
