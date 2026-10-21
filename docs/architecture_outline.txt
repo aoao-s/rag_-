@@ -1,0 +1,293 @@
+EduRAG-Pro 1.41 智能教育知识库
+
+  ① 定位与边界
+    一句话 <<K12 教学口径的问答 + 备课 + 讲解助手，从能跑升级到可交付。对标课程 EduRAG V7.5 / 场景模板 1.41；旧项目 Ragpro 是单文件 CLI 流水线，本项目是分层、依赖可注入、可观测、可离线部署的工程化版本。>>
+    四类用户场景
+      学员：知识点问答、题目讲解、学习规划
+      教师：教案生成、备课素材、学情分析
+      顾问：课程咨询、常见问题秒答
+      运营：未命中挖掘、知识纠错、质检
+    三个平级模块
+      qa_system：高频问题毫秒级答对，零 token
+      rag_system：长尾问题检索 + 重排 + 证据门
+      memory：记住这个学员是谁，但绝不进事实性回答 <<三模块互不 import，只共享 base/（config / logger / contracts / db / labels）。跨模块调用一律走契约数据类，禁止 import 对方的内部函数。>>
+    明确不做
+      团队记忆 Memory Hub（只做个人记忆）
+      多层记忆图谱 / 重要性打分模型
+      独立 GPU 向量集群（Milvus 单机足够）
+      多模态图 + 知识图谱的 GraphRAG（P2 以后再评估）
+
+  ② 技术栈
+    运行时
+      Python 3.12（conda env: ragpro）
+      Windows 11 + Docker Desktop（离线镜像） <<换环境必须重新核对：torch 2.14.1+cpu、transformers、FlagEmbedding 1.3.5、pymilvus 3.0.2、sentencepiece 0.2.0。版本组合踩过的坑见 docs/rag_system-运行手册.md §1。>>
+    Web 层
+      FastAPI + uvicorn
+      Pydantic 2 + pydantic-settings（.env 单一配置源）
+      SSE 流式 + WebSocket（规划）
+    编排层
+      LangGraph 状态机（规划中的 /v1/chat）
+      现状：service 直连，先跑通链路再上状态机
+    存储
+      MySQL 8.0：FAQ、会话、审计（真相源）
+      Redis 8.10：热数据、缓存、限流、单飞锁
+      Milvus 2.4.0：向量 + 稀疏倒排，HNSW + 混合检索
+      MinIO：原始文档与解析中间件
+    模型
+      BGE-M3：dense 1024 维 + sparse 词权重，一次编码出两路
+      bge-reranker-v2-m3：交叉重排，只在前 N 条上跑
+      BERT 意图：6 类，ONNX 推理 <5ms（未训练）
+      deepseek-flash（主）/ v4-pro（兜底）：生成与记忆抽取
+    文档解析
+      MinerU 云端 API（公式/表格/版面），失败自动退本地
+      PyMuPDF 本地兜底 + rapidocr 图片 OCR
+      python-docx / python-pptx / srt 字幕
+    观测
+      structlog 人读日志 + RotatingFileHandler
+      Prometheus /metrics（QPS、命中率、延迟、token）
+      trace_id 贯穿全链路（规划：OTel + Langfuse）
+
+  ③ 六层架构
+    接入层 Access
+      Web / App：会话式问答、流式渲染、引用卡片
+      API 网关：JWT、租户隔离、限流、审计
+      FastAPI 服务：SSE、断线续传、request_id 幂等
+      人工客服工作台：转人工单、知识纠错回填
+    编排层 Orchestration（LangGraph 状态机）
+      ① 归一化 + 敏感词
+      ② 会话改写（多轮指代消解）
+      ③ 多级缓存：精确 → 语义 → 会话
+      ④ 意图 + 槽位（学科/年级/题型）
+      ⑤ 策略规划：FAQ 直答 / Direct / HyDE / SubQuery / Backtrack
+      ⑥ 并行检索：dense ∥ sparse ∥ FAQ
+      ⑦ 融合重排：WeightedRanker → reranker → token 预算裁剪
+      ⑧ 证据门：四条判据，不过就拒答
+      ⑨ 流式生成：首 token 600ms 预算
+      ⑩ 引用校验：每句可溯源，否则重写或兜底 <<三条短路直接回到接入层：缓存命中、通用知识、证据不足转人工。每个节点都带超时预算、重试策略、降级出边。>>
+    能力层 Capability（可独立部署、可替换）
+      意图/槽位服务：BERT-small ONNX + 词典规则
+      检索服务：Milvus 混合检索 + 标量前置过滤
+      重排/证据服务：GPU 批量重排 + 证据门
+      LLM 网关：多模型路由、重试、熔断、计量
+    数据层 Storage
+      MySQL：FAQ、会话、反馈、文档元数据、审计
+      Redis：缓存、会话窗口、限流、分布式锁
+      Milvus：按 tenant/doc_type 分区，alias 灰度
+      MinIO/OSS：原始文档、解析中间件
+    离线层 Ingestion & Evaluation
+      摄入 DAG：解析→清洗→切分→质检，增量/幂等/可重跑
+      索引版本化：blue/green collection + alias 一键回滚
+      评估回归：黄金集 Recall/MRR + RAGAS 门禁
+      反馈闭环：未命中挖掘→审核→FAQ/知识修订
+    观测层 Observability
+      trace_id 贯穿全链路
+      Prometheus + Grafana：QPS、P95、命中率、token
+      可读日志：JSON 结构化 + 中文文案 + 轮转
+      Langfuse：提示词与答案质量人工标注（可选）
+
+  ④ qa_system（PR2 已落地）
+    职责 <<高频标准问题毫秒级答对、0 token；未命中给 top3 候选交棒 RAG。FAQ 答成兄弟题比不答更伤信任，所以判定用三条件而不是单一分数阈值。>>
+    检索链路
+      归一化：去标点/全半角/中文数字/口语表（咋→怎么、啥→什么）
+      精确哈希：同问同答直接命中（含别名整串等价）
+      分学科 BM25：k1=1.5、b=0.75、IDF=log(1+(N-df+0.5)/(df+0.5))
+      归一化分：score = raw / (raw + 12)
+      三条件判定：≥0.25 且跨候选领先 ≥0.10 且同科目
+      未命中：返回 top3 候选 + reason，交棒 RAG 或转人工
+    缓存（Redis）
+      key：edurag:{env}:faq:v{version}:{subject|*}:{sha1(归一化问法)}
+      正缓存：TTL 1h，绝对寿命 6h，命中续命但剩余 ≤50% 才续
+      负缓存：30s，带候选，防止热点空查打穿索引
+      失效：版本号 +1（发布/下线即重建快照） <<必须同时有绝对寿命：否则热点问题永远不过期，答案改了也改不动。>>
+    生命周期
+      draft → pending → published → deprecated
+      发布即重建：双缓冲快照原子替换，读不阻塞（2000 条约 50ms）
+    接口 <</v1/faq/search、/stats、/{id}、/{id}/publish、/deprecate、/rebuild>>
+    实测
+      2000 条 K12 语料，服务端 search 0.3ms，端到端 p50 5.7ms / p95 9.1ms
+      缓存命中 2–4ms；标定阈值 0.25/0.10：精度 0.95、召回 0.637 <<480 条同义问法由 deepseek-flash 生成，只能当起点；上线两周后要用真实点击 + 转人工记录重标。>>
+    已知待办
+      通用词降权（条件、实质这类词权重过高）
+      真实流量重标定、FAQ 审计表
+
+  ⑤ rag_system（PR3 已落地）
+    文档摄入
+      12 种后缀：md/txt/markdown/srt/docx/pptx/pdf/jpg/png/bmp/webp
+      PDF 三档：RAG_PDF_PARSER=auto|mineru|local
+      auto：云端任何异常退本地 PyMuPDF，日志留痕不静默
+      图片 strip：MinerU 的哈希图片名不进切分
+      OCR：rapidocr 进程内单例，小图放大到 600px 再识别
+    切分
+      父块 1200 / 重叠 100，子块 300 / 重叠 20
+      按句切分并保留标点，贪婪装箱 + 尾部重叠
+      Markdown 标题继承（最近两级），子块带 parent_text
+      doc_id = sha1(source) + 正文指纹：正文变了才换 id
+    向量化（BGE-M3）
+      dense 1024 + sparse 词权重，一次编码出两路
+      GPU FP16 / CPU FP32，batch 8，max_len 512
+      无模型时退确定性 hash 向量（只验证管线，不做质量评估）
+    存储（Milvus）
+      collection：edurag_chunk；库：edurag
+      dense：HNSW COSINE，M=16，efConstruction=200
+      sparse：SPARSE_INVERTED_INDEX，IP，drop_ratio_build=0.2
+      写入：先删后写（幂等重跑），分批 64，manifest 留档
+    检索链路
+      混合检索：WeightedRanker(0.7 dense, 0.3 sparse)
+      父块合并：子块命中按 parent_id 去重，保留最高分
+      可选重排：GPU 批量，只对前 40 条，失败降级融合分
+      证据组装：top_n 父块 + 引用结构（文件/标题/小节/页码）
+    证据门（四条判据）
+      ① 融合分 ≥ 0.74
+      ② 与另一篇文档的最好证据分差 ≥ 0.01（同文档多块算互相印证）
+      ③ 孤证时要求 top1 ≥ 阈值 + 0.10
+      ④ 问句实词覆盖率 qcov ≥ 0.20 <<标定来源：datasets/07_eval 1000 条 → 763 条可判定。分数门槛单独不够（可答/不可答 top1 中位数只差 0.04），qcov 是独立信号。选点口径误放行 ≤5%：可答放行 34%、误放 3%；放松到 0.72 则 50%/9%。>>
+    实测
+      622 块（15 文件）；CPU 首查 2.5s、热查 0.6s
+      CPU 重排 40 条 115s，RAG_RERANK_ENABLED=auto 自动跳过
+      黄金集中只有 20% 可答题能召回到正确文档：语料是瓶颈
+    已知问题
+      教案的课后作业/板书设计小节霸榜：词面覆盖满分但没讲解内容
+      MinerU 云端依赖网络；索引无版本化（--recreate 期间不可用）
+
+  ⑥ 记忆模块（PR4 设计定稿）
+    四层记忆
+      L0 工作记忆：当前会话逐字原文，40 轮 / 28K token 双上限
+      L1 会话摘要：每会话一份滚动摘要，400 token，留 90 天
+      L2 原子记忆：偏好/身份/约束/决定/进度，Milvus 按 user_id 分区 + MySQL
+      L3 用户画像：300 token，长期有效 <<越往上越接近结论、越省 token；每层保留向下追溯链接，可白盒溯源。>>
+    写入链路（异步，p95 ≤1.5s）
+      ① 规则门控 30ms：数字/日期/课程名/我要·打算·改·不去
+      ② deepseek-flash 按 JSON Schema 抽取 400–800ms
+      ③ 去重：向量相似度 >0.92 合并
+      ④ 冲突消解：同槽位新值 supersede，语义相反才让 LLM 判
+      ⑤ 摘要滚动：每 10 轮 / 3K token 增量摘要
+      ⑥ 落库 + 向量化：MySQL 事务写真相，Milvus 异步补
+    召回链路（并行，p95 ≤120ms）
+      A 画像直读：Redis 热点 → MySQL，必然命中
+      B 原子记忆：query 向量 top5，只取 valid_to 为空
+      C 会话摘要：当前 + 最近 3 个 session
+      D 逐字历史：Redis LIST，miss 回源 MySQL
+      RRF 融合，按 token 预算裁剪到 1000 token 注入
+    遗忘与删除
+      supersede 链：chain_root_id / valid_to / superseded_by
+      删最新一条：可选 revive（旧记忆恢复生效）或 purge_chain（整链失效）
+      软删 30 天 → 物理清理；级联 Redis / Milvus / audit
+      衰减：score = conf × exp(-age/90d) × (1+0.1×引用数)，<0.2 归档
+    记忆页与权限
+      画像卡就地编辑、按类型列表、为什么记住（下钻原话）
+      链视图、危险区（导出 / 清空 / 10 秒撤销）
+      学员读写删；顾问需 memory_grant（30 天只读 + 审计）；管理员只读聚合
+    参数基线 <<MEM_WINDOW_TURNS=40、MEM_WINDOW_TOKENS=28000、MEM_COMPRESS_BATCH_TURNS=10、MEM_ROLLUP_TOKENS=3000、MEM_SUMMARY_MAX_TOKENS=400、MEM_RECALL_TOP_K=5、MEM_RECALL_BUDGET_MS=120、MEM_DEDUPE_SIM=0.92>>
+
+  ⑦ QAF 与标签体系（P1 设计）
+    QAF = Question – Answer – Feedback
+      qa_pair：问答正文 + 状态 + 版本指针
+      qa_version：每次改动的全量快照，可回滚
+      feedback：固定 7 个标签，必带 request_id
+      miss_pool：未命中池，按相似度聚类后人工成团
+    生命周期 <<draft → pending → published → deprecated；发布即建双索引。发布硬门槛：published 的 QA 必须至少有一个 subject 标签，否则索引里无法按学科过滤。>>
+    四个来源
+      CSV 导入（存量 FAQ）
+      每周 miss_pool 聚类 Top20
+      差评 down≥3 且好评率 <0.6
+      人工新建
+    FAQ 混合检索
+      BM25 top20 ∥ 向量 top20，RRF k=60 融合
+      命中三条件：norm ≥0.62、top1−top2 ≥0.05、学科一致
+      未命中转 RAG，并把 top3 候选带进提示词
+    Tag 九个命名空间 <<intent / subject / course / level / scenario / audience / doc_type / risk / acl。标签是过滤前置条件，不是展示字段：subject 决定学科隔离，acl 决定可见性。>>
+    打标流水线
+      ① 词典 AC 自动机（pyahocorasick）
+      ② 正则规则（年级、题型、版本）
+      ③ deepseek-flash 零样本 JSON（置信度 <0.6 转人工）
+      ④ 冲突合并：human > rule > llm
+      ⑤ 人工复核队列
+      ⑥ Redis 树缓存 TTL 1h
+
+  ⑧ 稳定性与性能护栏
+    截止时间传递 <<入口 total 8s，逐节点扣减剩余预算；检索 800ms、首 token 600ms 硬上限。超时即走降级边，绝不重试主链路——重试会把一次超时放大成雪崩。>>
+    熔断与降级阶梯
+      HyDE / 子查询 → 直接检索
+      rerank → 加权分；LLM 失败率 >50% 熔断 30s
+      末级：FAQ 近义答案 → 兜底话术 → 转人工
+    并发与合并
+      意图分类 ∥ FAQ 检索；子查询 asyncio.gather
+      同一 query 单飞（singleflight）防缓存击穿
+      流式先返回首 token，不等全文
+    推理加速
+      启动预加载：加载 → 预热跑三条链路 → /readyz 放行
+      启动期 15–40s，期间 /healthz 200、/readyz 503 不导流
+      Embedding / Rerank 常驻 GPU，请求内零加载
+      ONNX / FP16；父块数量按 token 预算截断
+    质量门禁
+      引用必须可溯源到 parent_id → 文件 + 页码
+      忠实度校验不过 → 重写一次或走兜底
+      低置信意图 / 无证据 → 明确说不知道
+
+  ⑨ 数据模型
+    MySQL
+      qa 域：faq、faq_alias、faq_feedback
+      语料域：doc_meta、chunk_meta、ingest_manifest
+      会话域：chat_message、session_summary、request_log
+      记忆域：user_profile、memory_atom、memory_grant、memory_audit
+      QAF 域：qa_pair、qa_version、feedback、miss_pool
+      标签域：tag、tag_synonym、qa_tag、doc_tag
+    Redis key 规范
+      缓存：edurag:{env}:faq:v{n}:{subject}:{hash}
+      会话：edurag:{env}:session:{sid}
+      记忆：mem:hot:{user_id} / mem:sum:{sid}
+      其他：:rl:（限流）、:lock:（分布式锁）、:tag:tree:{ns}
+    Milvus
+      edurag_chunk：chunk_id / doc_id / parent_id / text / parent_text
+      标量：source / title / subject / doc_type / heading / page / chunk_index
+      向量：dense(1024) + sparse；过滤前置 tenant / doc_type
+
+  ⑩ 接口契约
+    健康与观测 <</healthz（存活）、/readyz（就绪，未就绪 503）、/metrics（Prometheus）>>
+    qa_system <</v1/faq/search、/stats、/{id}、/{id}/publish、/deprecate、/rebuild>>
+    rag_system <</v1/rag/search、/v1/rag/stats。search 返回：top_score / cost_ms / raw_hits / reranked / degraded / evidence{passed,reason,top_score,margin,n_docs,qcov} / citations / evidences>>
+    规划中 <</v1/chat（SSE 流式 + 引用）、/v1/memory/*（14 个）、/v1/feedback>>
+
+  ⑪ 参数基线
+    检索 <<RAG_TOP_K=40、RAG_FINAL_N=6、融合 0.7/0.3、RERANK_CANDIDATES=40>>
+    切分 <<父 1200/100、子 300/20、单文档上限 2000 块>>
+    证据门 <<RAG_EVIDENCE_THRESHOLD=0.74、MARGIN=0.01、QCOV=0.20、MIN_DOCS=1>>
+    FAQ <<FAQ_THRESHOLD=0.25、FAQ_MARGIN=0.10、FAQ_NORM_K=12、TOP_K=20>>
+    缓存 <<FAQ 正缓存 3600s / 绝对 21600s / 续命比例 0.5 / 负缓存 30s>>
+    记忆 <<40 轮 / 28000 token、摘要 400、原子 top5、召回预算 120ms>>
+    重排 <<RAG_RERANK_ENABLED=auto（无 CUDA 自动跳过）、截断 2000 字符>>
+
+  ⑫ 评估与验收
+    FAQ <<黄金问法 480 条：精度 0.95 / 召回 0.637（阈值 0.25 + margin 0.10）>>
+    RAG <<黄金集 1000 条→763 条可判定：可答放行 34%、误放 3%>>
+    质量指标 <<Recall@10 ≥0.90、忠实度 ≥0.95、引用可溯源 100%>>
+    性能指标 <<首 token p95 ≤1.2s、完整答案 p95 ≤4s、检索 p95 ≤170ms（GPU）>>
+    工程指标 <<单测 104 条全绿；启动预加载 + /readyz 门控。评估脚本 scripts/eval_faq.py、scripts/eval_rag.py，报告在 docs/analysis/。>>
+
+  ⑬ 路线图与状态（截至 2026-10-21）
+    ✅ P0 已完成
+      PR1 地基：配置 / 标签 / 契约 / 日志 / DB / Redis
+      PR2 qa_system：检索 + 缓存 + 生命周期 + 阈值标定
+      PR3 rag_system：摄入 + 切分 + 向量 + 检索 + 证据门 + 接入服务
+      离线数据面：MySQL / Redis / Milvus 全部容器化 + 离线镜像
+    ⏳ P0 进行中
+      编排层 /v1/chat：FAQ→RAG 路由、流式生成、引用对齐
+      意图分类：数据已体检（6 类 / 2705 条），未训练
+    P1
+      记忆模块（设计定稿，待实现）
+      QAF + Tag 体系
+      GPU 重排（需 CUDA 环境）
+      索引版本化 blue/green
+    P2
+      多租户隔离与配额
+      Langfuse / OTel 全链路追踪
+      多模态与知识图谱增强
+
+  ⑭ 工程约定
+    目录 <<main.py / base/ / qa_system/ / rag_system/ / memory/ / docker/ / docs/ / scripts/ / tests/>>
+    依赖方向 <<接入层 → 编排层 → {理解, 检索, 生成, 知识} → base/ → 外部服务。禁止反向 import；跨模块只用 base/contracts.py 的数据类。>>
+    日志 <<时间 [级别] [pid:线程] 模块 (文件:行号) 中文文案 + 结构化字段。控制台 LOG_LEVEL、文件 LOG_FILE_LEVEL 分级；默认不记原始 query（LOG_QUERY_TEXT=false）。>>
+    配置 <<只从 base/config.py 读，禁止 os.getenv 散落各处>>
+    测试 <<pytest；不依赖外部服务（Milvus / 模型全部 Fake 或 hash 向量）>>
+    提交 <<feat/fix/docs/chore(scope): 说明，一次提交一件事>>
+    数据集 <<datasets/ 是只读资产：不改、不删、不入 git>>
