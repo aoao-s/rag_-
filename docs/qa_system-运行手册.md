@@ -104,13 +104,18 @@ curl "http://127.0.0.1:8124/metrics"
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/faq/search?q=&subject=` | 查询；返回 `FAQHit`（含 `candidates` 与 `latency_ms`） |
-| GET | `/v1/faq/stats` | 语料版本 + 命中率/延迟统计 |
+| GET | `/v1/faq/search?q=&subject=&selected_faq_id=` | 查询；返回 `FAQHit`（含 `tier` / `subject_state` / `degraded` / `candidates` / `latency_ms`）。`subject` 不在词表内（含别名）→ **400 `subject_invalid`**，响应体列出合法学科；不传 = 全库。`selected_faq_id` 是 mid 档追问被采纳后的**用户确认通道**（返回该条答案，逐字，`reason=user_confirmed`），id 无效只记 `degraded` 不报错 |
+| GET | `/v1/faq/stats` | 语料版本 + 命中率/延迟统计；`stats.tiers` 为 high/mid/low 三档计数（`routes` 是检索范围计数，两者别混读） |
 | GET | `/v1/faq/{id}` | 单条排查 |
 | POST | `/v1/faq/{id}/publish` | 发布并重建（需 `X-Admin-Token`） |
 | POST | `/v1/faq/{id}/deprecate` | 下线并重建（需 `X-Admin-Token`） |
 | POST | `/v1/faq/rebuild` | 手动重建 |
 | GET | `/healthz` `/readyz` `/metrics` | 存活 / 就绪 / Prometheus |
+
+**行为变更（2026-10-27，三档路由 §7.1.9）**：`hit` 现在等价于 `tier == "high"`。以前 `hit=true` 的命中里，
+margin 落在 `[FAQ_MARGIN, FAQ_HIGH_MARGIN)` 的那部分会变成 `tier="mid"` / `hit=false`、`answer` 为空
+（只给 `matched_question` 与候选，交给 RAG + 追问）。**回滚**：把 `FAQ_HIGH_MARGIN` 设成与 `FAQ_MARGIN` 相同，
+即精确恢复单档行为（不需要改代码）。
 
 ## 6. 日志与缓存（2026-10-20 新增）
 
@@ -171,21 +176,27 @@ docker exec edurag-redis redis-cli -a 1234 --no-auth-warning flushdb
 
 ## 7. 已知待办
 
-- `FAQ_THRESHOLD=0.25` / `FAQ_MARGIN=0.10` 已用 480 条合成同义问法 + 80 条题库负样本标定
+- `FAQ_THRESHOLD=0.25` / `FAQ_MARGIN=0.10` 是在 **160 条**语料上用 480 条合成同义问法 + 80 条题库负样本标定的
   （`docs/analysis/faq_threshold_report.md`，precision 0.950 / recall 0.637）。
-  合成样本只能当起点：上线两周后要用真实点击与转人工记录重标。
+  **该结论已失效**：语料扩到 2000 条后 480 条标签全部对不上（CLAUDE.md §7.1.7），
+  重标定完成前只能当保守兜底；同时要按 `FAQ_MARGIN_MODE` 比较 relative/normalized/raw 三种分差。
 - 同题族（勾股定理「内容 / 证明 / 应用」）靠 margin 兜住；若线上仍出现"答成兄弟题"，优先补别名，不要再降阈值。
 - 别名表目前只做「整串等价」（`faq_alias`），子串替换会产生"学费学费多少"这类脏串，已明确不做。
 - 语料 >5 万条时把全量重建换成文档级增量（现在 160 条约 50 ms，不值得提前优化）。
+- **旧库历史数据**：2026-10-26 之前导入的 MySQL 里，97 行"道德与法治"的 `subject` 是空串
+  （旧 `SUBJECTS` 只有"政治"，导入时被归一成 None）。补了 `SUBJECT_ALIASES` 之后需要
+  重跑 `python scripts/import_faq.py --csv datasets/04_faq/edu_faq.csv --publish`
+  （或 `UPDATE faq SET subject_name='道德与法治' WHERE subject_name=''`）才能按学科检索到它们；
+  内存/CSV 模式不受影响。
 
 ### 6.3 分数是怎么算出来的
 
 检索分不是"模型打分"，是 **BM25 原始分 → 有理函数压缩到 (0,1)**，四步：
 
 1. **归一化 + 分词**：`qa_normalize.py` 去标点/全半角/lower、中文数字转阿拉伯、口语替换（咋→怎么），
-   `jieba` 精确模式 + 学科词入词典。如 `自然数是什么东西` → `['自然数','什么','东西']`。
-2. **分学科建索引**：每个 `subject` 一份 `BM25Index`（数学 605 条、物理 …），IDF 各自独立——
-   否则小科目（地理、生物）的分数会被大科目稀释，一个阈值无法跨学科通用。
+   `jieba` 精确模式 + 学科词入词典。如 `绝对值什么意思` → `['绝对值','什么','意思']`。
+2. **分学科建索引**：每个 `subject` 一份 `BM25Index`（当前 2000 条语料合并重复问法后：数学 331 条、物理 …），
+   IDF 各自独立——否则小科目（地理、生物）的分数会被大科目稀释，一个阈值无法跨学科通用。
 3. **BM25 打分**（`qa_corpus.py:53`，`k1=1.5`、`b=0.75`、IDF 取 `log(1+(N-df+0.5)/(df+0.5))` 保证非负）：
 
    ```
@@ -195,22 +206,36 @@ docker exec edurag-redis redis-cli -a 1234 --no-auth-warning flushdb
 4. **归一化**（`qa_matcher.py:34`）：`s = raw / (raw + 12)`，`FAQ_NORM_K=12`。
    用有理函数而非 min-max，是为了不依赖"先知道语料里的最高分"——语料增删后尺度不漂。
 
-实算一条（数学库，`自然数是什么` 这条 FAQ）：
+实算一条（数学库 `N=331`、`avgdl=5.08`，查 `绝对值什么意思`，命中 FAQ `什么是绝对值？`，该文档 `|d|=2`）：
 
 | 词 | df | idf | tf | 贡献 |
 | --- | --- | --- | --- | --- |
-| 自然数 | 3 | 5.154 | 1 | 6.298 |
-| 什么 | 74 | 2.096 | 1 | 2.561 |
-| 东西 | 0 | 0 | 0 | 0（不在语料，不计） |
+| 绝对值 | 1 | 5.3997 | 1 | 7.4273 |
+| 什么 | 229 | 0.3692 | 1 | 0.5079 |
+| 意思 | 0 | 0 | 0 | 0（不在语料，不计） |
 
-`raw = 8.859 → 8.859/(8.859+12) = 0.4247`，就是控制台那个分数。
+`raw = 7.9352 → 7.9352/(7.9352+12) = 0.3980`，就是控制台那个分数。
+注意 `什么` 出现在 229/331 条问题里（df 高、idf 只有 0.37），全靠 `绝对值` 这个学科词撑分——
+这也是为什么"问句框架词"不能进索引区分度：它们在所有问题上都出现。
 
-**判定不是只看这个分**（`decide()` 三条件）：
+> 本表由 `scripts/eval_faq.py baseline` 同版本语料实测；语料或分词改动后必须重算，别沿用旧数字
+> （2026-10-26 语料改写后，旧版手册里基于"自然数"的例子已整条失效）。
+
+**判定不是只看这个分**（`decide()` 三条 + 路由一条，见 CLAUDE.md §7.1.2 / §7.1.8）：
 
 - `top1 ≥ FAQ_THRESHOLD(0.25)`：绝对分够；
-- `top1 − top2 ≥ FAQ_MARGIN(0.10)`：领先第二名够多。上例 top2 是 `0.311`，margin `0.114` → 命中；
-  `顶点式怎么写` 的 top1/top2 是 0.4165/0.3885，margin 只有 0.028 → 判 `ambiguous`，宁可交棒 RAG；
-- 学科一致：限定学科时只在对应分片里检索。
+- 候选数 ≥ `FAQ_MIN_CANDIDATES(2)`：只有 1 条候选时"领先第二名"没有意义，直接判 `single_candidate`；
+- 分差 ≥ `FAQ_MARGIN(0.10)`：领先第二名够多。上例 top2 是 `0.0423`（`什么是圆周角？圆周角定理是什么？`），
+  margin `0.3557` → 命中；query 与 top2 之间没有任何共用实词时，top2 就会落到这种地板分。
+  反例（题族）：`角的平分线的性质` 与 `角的平分线` 两条问题的 margin 只有 `0.039`
+  （见 `docs/analysis/faq_diagnosis.md` 的 D2 表），任何第三种问法都会被判 `ambiguous` 而交棒 RAG——
+  这正是 §7.1.7「语料重复合并」与第四步三档路由要处理的区间。
+  分差所在空间由 `FAQ_MARGIN_MODE` 决定：`relative`（默认目标，`(raw1−raw2)/raw1`）/
+  `normalized`（现网默认，`score1−score2`）/ `raw`（仅同学科索引内可解释）；
+- 学科状态：只有 `subject_source=explicit` 允许直接答。`inferred/context` 看得到该学科索引但
+  必须交 RAG 或追问；`invalid` 对外 400、内部全库兜底并带 `degraded`；`empty` 返回
+  `subject_empty` 且**不**兜底。返回值里的 `subject_state`（filtered/multi/full/empty）
+  就是本次实际检索范围。
 
 **两个 1.0 不是 BM25 分**：精确哈希命中（归一化后整串相等）与别名命中直接给 `score=1.0`，
 接口上看到 1.0 就说明"逐字/等价命中"，不是"最相似"。
@@ -243,18 +268,42 @@ docker exec edurag-redis redis-cli -a 1234 --no-auth-warning flushdb
 ## 8. 阈值标定（可复跑，不需要数据库）
 
 ```bash
-# 1) 生成同义问法（deepseek-flash，160 条 FAQ × 3 变体，断点续跑）
-python scripts/eval_faq.py gen --concurrency 6
+# 0) 语料体检：条数 / 指纹 / 归一化指纹 / 原句自检，三项任一不达标 exit=2
+python scripts/eval_faq.py baseline
 
-# 2) 二维扫描（threshold × margin）并写报告
+# 1) 重建样本（正样本口语变体 + 负样本陷阱），旧样本自动归档到 docs/analysis/archive/
+python scripts/eval_faq.py gen
+python scripts/eval_faq.py negatives
+
+# 2) 二维扫描（threshold × margin，三套 margin 空间各扫一遍）并写报告
 python scripts/eval_faq.py calibrate
+
+# 3) 诊断：召回丢在哪一层（阈值/候选数/margin），题族值不值得标题族
+python scripts/eval_faq.py diagnose
 ```
 
 产物：
 
-- `docs/analysis/faq_paraphrases.jsonl`：480 条同义问法（含 faq_id 标签）
-- `docs/analysis/faq_threshold_report.md`：分数分布 + 一维/二维扫描 + 推荐点
+- `docs/analysis/faq_corpus_baseline.{md,json}`：语料指纹、归一化指纹、原句自检结果
+- `docs/analysis/faq_paraphrases.jsonl` / `faq_negatives.jsonl`：正/负样本（带 `faq_id`、类别、来源）
+- `docs/analysis/faq_threshold_report.md`：分数分布 + dev 选点 + test 报数 + 邻域切片 + 可达性
+- `docs/analysis/faq_diagnosis.md`：D1（召回丢在哪一层）+ D2（题族代理）+ 机制预演
 
-当前推荐点：`threshold=0.25`、`margin=0.10`（precision 0.950、recall 0.637）。
-分数尺度由 `FAQ_NORM_K`（默认 12）决定，改 K、改分词、改同义词表都要重跑标定。
+**现行线上参数**：`normalized / 0.25 / 0.10`（`FAQ_MARGIN_MODE` / `FAQ_THRESHOLD` / `FAQ_MARGIN`）。
+分数尺度由 `FAQ_NORM_K`（默认 12）决定，改 K、改分词、改同义词表、改语料都要重跑标定。
+
+三轮标定的诚实结论（详见报告与 CLAUDE.md §7.1.7）：
+
+| 轮次 | 改了什么 | test 召回 / 精度 | 过闸 |
+| --- | --- | --- | --- |
+| 第一轮 | 关键词式短句语料，负样本 840 | 0.078 / 0.808（全网格精度上界 0.897） | 否（精度不可达） |
+| 第二轮 | 项目方把 FAQ 问题改写成完整问句；`unrelated` 归零 | 0.382 / 0.824 | 否 |
+| 第三轮 | **装载期合并重复问法**（2000 → 1374 进索引）+ 补回 `unrelated` 300 条 | **0.735 / 0.859** | 否（召回过线，精度未到 0.95） |
+
+第三轮是唯一一次**召回过线**（目标 0.637）的改动，靠的是语料装载而不是调参：
+同学科 + 答案逐字相同 + 去问句框架词后 Jaccard ≥0.8 的问法并成一条，只留最小 `faq_id` 进 BM25 索引，
+其余登记为精确命中别名（原问法仍可直接答）。开关 `FAQ_DEDUPE_NEAR_DUP`（默认 `true`，置 `false` 仅用于对照实验）。
+`/v1/faq/stats` 的 `docs` 是载入条数、`indexed` 是实际进索引条数、`merged_duplicates` 是被合并条数——
+三者对不上时先看这里。答案不同但问法几乎相同的对**不合并**，日志里打 `faq_near_dup_answer_conflict` 交教研。
+
 

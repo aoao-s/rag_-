@@ -1,0 +1,520 @@
+<title>EduRAG-Pro 系统结构图</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap">
+<style>
+  /* 布局概念：一张"工程蓝图"式分层图——上部在线请求、中部业务模块、下部底座与外部依赖。
+     颜色全部走 token，浅色为暖纸色，深色为深海蓝；虚线框 = 设计已定但尚未落地的模块。 */
+  :root {
+    --bg: #f4f2ec;
+    --panel: #fbfaf6;
+    --panel-2: #ffffff;
+    --ink: #17212b;
+    --muted: #5f6b78;
+    --line: #d5cfc2;
+    --grid: #e7e2d7;
+    --accent: #0f6b5f;
+    --frontend: #0e7490;
+    --frontend-fill: rgba(14, 116, 144, 0.07);
+    --backend: #047857;
+    --backend-fill: rgba(4, 120, 87, 0.07);
+    --db: #6d28d9;
+    --db-fill: rgba(109, 40, 217, 0.07);
+    --ext: #b45309;
+    --ext-fill: rgba(180, 83, 9, 0.07);
+    --plan: #5b6b7c;
+    --plan-fill: rgba(91, 107, 124, 0.05);
+    --rose: #be123c;
+    --mono: "JetBrains Mono", "Noto Sans SC", monospace;
+    --sans: "Noto Sans SC", system-ui, -apple-system, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #080d14;
+      --panel: #0d1520;
+      --panel-2: #111b2a;
+      --ink: #e6eef8;
+      --muted: #93a3b8;
+      --line: #22314a;
+      --grid: #152033;
+      --accent: #2dd4bf;
+      --frontend: #22d3ee;
+      --frontend-fill: rgba(34, 211, 238, 0.08);
+      --backend: #34d399;
+      --backend-fill: rgba(52, 211, 153, 0.08);
+      --db: #a78bfa;
+      --db-fill: rgba(167, 139, 250, 0.09);
+      --ext: #fbbf24;
+      --ext-fill: rgba(251, 191, 36, 0.08);
+      --plan: #8fa3ba;
+      --plan-fill: rgba(143, 163, 186, 0.06);
+      --rose: #fb7185;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #080d14;
+    --panel: #0d1520;
+    --panel-2: #111b2a;
+    --ink: #e6eef8;
+    --muted: #93a3b8;
+    --line: #22314a;
+    --grid: #152033;
+    --accent: #2dd4bf;
+    --frontend: #22d3ee;
+    --frontend-fill: rgba(34, 211, 238, 0.08);
+    --backend: #34d399;
+    --backend-fill: rgba(52, 211, 153, 0.08);
+    --db: #a78bfa;
+    --db-fill: rgba(167, 139, 250, 0.09);
+    --ext: #fbbf24;
+    --ext-fill: rgba(251, 191, 36, 0.08);
+    --plan: #8fa3ba;
+    --plan-fill: rgba(143, 163, 186, 0.06);
+    --rose: #fb7185;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    margin: 0;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 40px 32px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 1200px; margin: 0 auto; }
+
+  header { margin-bottom: 22px; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .pulse {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  h1 {
+    font-size: clamp(26px, 4vw, 34px);
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    margin: 10px 0 8px;
+    text-wrap: balance;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.7;
+    max-width: 68ch;
+    margin: 0;
+  }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--muted);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 5px 11px;
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  .dot.ok { background: var(--backend); }
+  .dot.part { background: var(--ext); }
+  .dot.todo { background: var(--plan); }
+
+  .diagram-card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px;
+    margin-top: 22px;
+  }
+  .scroll { overflow-x: auto; }
+  svg { display: block; width: 100%; min-width: 980px; height: auto; }
+
+  /* --- SVG 视觉语言 --- */
+  .boundary { fill: none; stroke: var(--line); stroke-width: 1; stroke-dasharray: 7 5; }
+  .blabel { fill: var(--muted); font-size: 10px; letter-spacing: 0.03em; }
+  .divider { stroke: var(--line); stroke-width: 1; }
+  .arrow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
+  .arrow.accent { stroke: var(--accent); }
+
+  .b-neutral { fill: var(--panel-2); stroke: var(--line); stroke-width: 1.4; }
+  .b-frontend { fill: var(--frontend-fill); stroke: var(--frontend); stroke-width: 1.4; }
+  .b-backend { fill: var(--backend-fill); stroke: var(--backend); stroke-width: 1.4; }
+  .b-db { fill: var(--db-fill); stroke: var(--db); stroke-width: 1.4; }
+  .b-ext { fill: var(--ext-fill); stroke: var(--ext); stroke-width: 1.4; }
+  .b-plan { fill: var(--plan-fill); stroke: var(--plan); stroke-width: 1.3; stroke-dasharray: 5 4; }
+  .b-module { fill: var(--panel-2); stroke: var(--backend); stroke-width: 1.3; }
+  .b-module.plan { stroke: var(--plan); stroke-dasharray: 5 4; fill: var(--plan-fill); }
+  .b-base { fill: var(--panel-2); stroke: var(--db); stroke-width: 1.2; }
+
+  .t-title { fill: var(--ink); font-size: 12px; font-weight: 600; }
+  .t-title-lg { fill: var(--ink); font-size: 13px; font-weight: 700; }
+  .t-sub { fill: var(--muted); font-size: 9px; }
+  .t-line { fill: var(--muted); font-size: 10px; }
+  .t-note { fill: var(--accent); font-size: 9px; }
+  .t-tag { fill: var(--plan); font-size: 8px; letter-spacing: 0.06em; }
+  .t-arrow { fill: var(--muted); font-size: 9px; }
+  .t-legend { fill: var(--muted); font-size: 9px; }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+    gap: 14px;
+    margin-top: 22px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 16px 17px;
+  }
+  .card-head { display: flex; align-items: center; gap: 9px; margin-bottom: 11px; }
+  .card-head h3 { font-size: 13px; font-weight: 700; margin: 0; letter-spacing: 0.01em; }
+  .card ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+  .card li {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.65;
+    padding-left: 14px;
+    position: relative;
+  }
+  .card li::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 8px;
+    width: 4px; height: 4px;
+    border-radius: 50%;
+    background: var(--line);
+  }
+  .card li strong { color: var(--ink); font-weight: 600; }
+  code {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 5px;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+
+  footer {
+    margin-top: 26px;
+    padding-top: 16px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.7;
+    font-family: var(--mono);
+  }
+
+  @media (max-width: 640px) {
+    body { padding-block: 26px 24px; }
+    .diagram-card { padding: 10px; }
+  }
+</style>
+
+<div class="page">
+  <header>
+    <div class="eyebrow"><span class="pulse"></span>EduRAG-Pro 1.41 · 交付仓库</div>
+    <h1>系统结构图</h1>
+    <p class="subtitle">
+      从客户端到 MySQL / Redis / Milvus：接入层、三块平级的业务模块、公共底座，以及启动期加载到 GPU 的模型。
+      实线是已落地的代码路径，虚线是设计已定、尚未实现的模块。
+    </p>
+    <div class="pills">
+      <span class="pill"><i class="dot ok"></i>qa_system 已实现</span>
+      <span class="pill"><i class="dot ok"></i>rag_system 检索已通</span>
+      <span class="pill"><i class="dot part"></i>意图 BERT 训练中</span>
+      <span class="pill"><i class="dot todo"></i>memory / 编排 待建</span>
+    </div>
+  </header>
+
+  <section class="diagram-card">
+    <div class="scroll">
+      <svg viewBox="0 0 1200 1020" role="img" aria-label="EduRAG-Pro 分层系统结构图" style="font-family: var(--mono)">
+        <defs>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" style="stroke: var(--grid); stroke-width: 0.6"/>
+          </pattern>
+          <marker id="arw" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" style="fill: var(--muted)"/>
+          </marker>
+          <marker id="arw-accent" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" style="fill: var(--accent)"/>
+          </marker>
+        </defs>
+
+        <rect width="1200" height="1020" fill="url(#grid)"/>
+
+        <!-- ================= 客户端 ================= -->
+        <text class="blabel" x="60" y="18">客户端 / 调用方</text>
+
+        <rect class="b-frontend" x="60" y="24" width="250" height="58" rx="8"/>
+        <rect x="60" y="24" width="250" height="58" rx="8" fill="none" stroke="var(--frontend)" stroke-width="1.4" stroke-dasharray="5 4"/>
+        <text class="t-title" x="185" y="49" text-anchor="middle">学员 / 咨询顾问</text>
+        <text class="t-sub" x="185" y="66" text-anchor="middle">浏览器 · Vue3（待实现）</text>
+
+        <rect class="b-neutral" x="340" y="24" width="180" height="58" rx="8"/>
+        <text class="t-title" x="430" y="49" text-anchor="middle">第三方调用方</text>
+        <text class="t-sub" x="430" y="66" text-anchor="middle">REST / SDK</text>
+
+        <rect class="b-neutral" x="550" y="24" width="200" height="58" rx="8"/>
+        <text class="t-title" x="650" y="49" text-anchor="middle">运维探针</text>
+        <text class="t-sub" x="650" y="66" text-anchor="middle">healthz · readyz · metrics</text>
+
+        <rect class="b-neutral" x="780" y="24" width="180" height="58" rx="8"/>
+        <text class="t-title" x="870" y="49" text-anchor="middle">脚本 / 评测</text>
+        <text class="t-sub" x="870" y="66" text-anchor="middle">scripts/ · pytest</text>
+
+        <line class="arrow accent" x1="600" y1="82" x2="600" y2="109" marker-end="url(#arw-accent)"/>
+        <text class="t-arrow" x="612" y="99">HTTPS / REST</text>
+
+        <!-- ================= 应用进程 ================= -->
+        <rect class="boundary" x="40" y="112" width="1120" height="700" rx="14" style="stroke: var(--ext)"/>
+        <text class="blabel" x="58" y="134" style="fill: var(--ext)">应用进程 · uvicorn :8000（python main.py）</text>
+
+        <!-- 接入层 -->
+        <text class="blabel" x="60" y="160">接入层 · main.py</text>
+
+        <rect class="b-backend" x="60" y="172" width="300" height="74" rx="8"/>
+        <text class="t-title" x="76" y="197">Container · lifespan</text>
+        <text class="t-sub" x="76" y="215">启动装载 → 依赖容器</text>
+        <text class="t-sub" x="76" y="231">readyz 门控 · 优雅停机</text>
+
+        <rect class="b-neutral" x="380" y="172" width="260" height="74" rx="8"/>
+        <text class="t-title" x="396" y="197">trace 中间件</text>
+        <text class="t-sub" x="396" y="215">request_id · 结构化日志</text>
+        <text class="t-sub" x="396" y="231">X-Request-Id 回传</text>
+
+        <rect class="b-neutral" x="660" y="172" width="250" height="74" rx="8"/>
+        <text class="t-title" x="676" y="197">运维端点</text>
+        <text class="t-sub" x="676" y="215">/healthz · /readyz · /metrics</text>
+        <text class="t-sub" x="676" y="231">prometheus-client</text>
+
+        <rect class="b-backend" x="930" y="172" width="210" height="74" rx="8"/>
+        <text class="t-title" x="946" y="197">路由聚合</text>
+        <text class="t-sub" x="946" y="215">app.include_router(…)</text>
+        <text class="t-sub" x="946" y="231">faq + rag 两套 router</text>
+
+        <line class="arrow" x1="600" y1="248" x2="600" y2="283" marker-end="url(#arw)"/>
+        <text class="t-arrow" x="612" y="271">路由分发</text>
+
+        <!-- ================= 业务模块 ================= -->
+        <rect class="boundary" x="40" y="286" width="1120" height="356" rx="14" style="stroke: var(--backend)"/>
+        <text class="blabel" x="58" y="308" style="fill: var(--backend)">业务模块 · 平级、互不 import，只共享 base/contracts.py</text>
+
+        <!-- qa_system -->
+        <rect class="b-module" x="60" y="318" width="340" height="300" rx="10"/>
+        <text class="t-title-lg" x="76" y="346">qa_system</text>
+        <text class="t-sub" x="76" y="366">FAQ 精准问答 · p95 ≤ 15 ms</text>
+        <line class="divider" x1="76" y1="378" x2="384" y2="378"/>
+        <text class="t-line" x="76" y="400">api.py · /v1/faq/search|stats|{id}</text>
+        <text class="t-line" x="76" y="424">FAQService（qa_search.py）</text>
+        <text class="t-line" x="76" y="448">qa_matcher · 阈值 / 间隔 / 学科</text>
+        <text class="t-line" x="76" y="472">qa_corpus · 分学科 BM25</text>
+        <text class="t-line" x="76" y="496">qa_normalize · 归一化 · 别名</text>
+        <text class="t-line" x="76" y="520">qa_cache · Redis 正 / 负缓存</text>
+        <text class="t-line" x="76" y="544">qa_db · MySQL / 内存仓库</text>
+        <text class="t-note" x="76" y="584">命中即逐字返回；未命中交棒 RAG</text>
+
+        <!-- rag_system -->
+        <rect class="b-module" x="420" y="318" width="380" height="300" rx="10"/>
+        <text class="t-title-lg" x="436" y="346">rag_system</text>
+        <text class="t-sub" x="436" y="366">知识检索 · 检索 p95 ≤ 170 ms</text>
+        <line class="divider" x1="436" y1="378" x2="784" y2="378"/>
+        <text class="t-line" x="436" y="400">api.py · /v1/rag/search|stats</text>
+        <text class="t-line" x="436" y="424">Retriever · dense + sparse 混合召回</text>
+        <text class="t-line" x="436" y="448">Reranker · bge-reranker-v2-m3</text>
+        <text class="t-line" x="436" y="472">EvidenceGate · 四判据证据门</text>
+        <text class="t-line" x="436" y="496">embedding/bge_m3 · 稠密 + 稀疏</text>
+        <text class="t-line" x="436" y="520">store/milvus_store · HNSW + 倒排</text>
+        <text class="t-line" x="436" y="544">ingest.py · loaders → splitters（离线）</text>
+        <text class="t-note" x="436" y="584">证据不足 → 兜底 / 转人工，不生成</text>
+
+        <!-- 计划中的模块 -->
+        <rect class="b-module plan" x="820" y="318" width="320" height="92" rx="10"/>
+        <text class="t-title" x="836" y="343">memory/ · 记忆模块</text>
+        <text class="t-tag" x="1124" y="343" text-anchor="end">PR4 待实现</text>
+        <text class="t-sub" x="836" y="362">四层记忆 L0–L3 · recall ≤ 120 ms</text>
+        <text class="t-sub" x="836" y="378">MemoryWriter · Redis Stream 异步写</text>
+        <text class="t-sub" x="836" y="394">extractor / dedupe / conflict</text>
+
+        <rect class="b-module plan" x="820" y="424" width="320" height="92" rx="10" style="stroke: var(--ext); stroke-dasharray: 5 4"/>
+        <text class="t-title" x="836" y="449">意图分类 · BERT</text>
+        <text class="t-tag" x="1124" y="449" text-anchor="end" style="fill: var(--ext)">训练中</text>
+        <text class="t-sub" x="836" y="468">bert_train_model / bert_test_model</text>
+        <text class="t-sub" x="836" y="484">datasets/06_intent · 6 类 5,100 条</text>
+        <text class="t-sub" x="836" y="500">输出 INTENT_LABELS / INTENT2ID</text>
+
+        <rect class="b-module plan" x="820" y="530" width="320" height="88" rx="10"/>
+        <text class="t-title" x="836" y="555">编排层 · LangGraph</text>
+        <text class="t-tag" x="1124" y="555" text-anchor="end">PR5 待实现</text>
+        <text class="t-sub" x="836" y="574">12 节点 · WS 四类帧</text>
+        <text class="t-sub" x="836" y="590">会话改写 · 策略规划 · 缓存</text>
+
+        <!-- ================= 公共底座 ================= -->
+        <line class="arrow" x1="230" y1="644" x2="230" y2="657" marker-end="url(#arw)"/>
+        <line class="arrow" x1="610" y1="644" x2="610" y2="657" marker-end="url(#arw)"/>
+        <line class="arrow" x1="980" y1="644" x2="980" y2="657" marker-end="url(#arw)"/>
+
+        <rect class="boundary" x="40" y="660" width="1120" height="152" rx="14" style="stroke: var(--db)"/>
+        <text class="blabel" x="58" y="682" style="fill: var(--db)">base/ · 公共底座（无业务语义，谁都能用）</text>
+
+        <rect class="b-base" x="60" y="696" width="200" height="100" rx="8"/>
+        <text class="t-title" x="76" y="721">config.py</text>
+        <text class="t-sub" x="76" y="741">pydantic-settings</text>
+        <text class="t-sub" x="76" y="757">阈值 / TTL 唯一出处</text>
+
+        <rect class="b-base" x="272" y="696" width="210" height="100" rx="8"/>
+        <text class="t-title" x="288" y="721">logger.py</text>
+        <text class="t-sub" x="288" y="741">+ log_messages.py</text>
+        <text class="t-sub" x="288" y="757">双出口 · 轮转 · 人读行</text>
+
+        <rect class="b-base" x="494" y="696" width="180" height="100" rx="8"/>
+        <text class="t-title" x="510" y="721">labels.py</text>
+        <text class="t-sub" x="510" y="741">INTENT_LABELS</text>
+        <text class="t-sub" x="510" y="757">INTENT2ID / ID2INTENT</text>
+
+        <rect class="b-base" x="686" y="696" width="200" height="100" rx="8"/>
+        <text class="t-title" x="702" y="721">contracts.py</text>
+        <text class="t-sub" x="702" y="741">FAQHit · Chunk</text>
+        <text class="t-sub" x="702" y="757">Evidence · MemoryContext</text>
+
+        <rect class="b-base" x="898" y="696" width="200" height="100" rx="8"/>
+        <text class="t-title" x="914" y="721">db.py</text>
+        <text class="t-sub" x="914" y="741">MySQL 连接池</text>
+        <text class="t-sub" x="914" y="757">建连接的唯一入口</text>
+
+        <!-- ================= 外部依赖 ================= -->
+        <line class="arrow" x1="600" y1="814" x2="600" y2="845" marker-end="url(#arw)"/>
+        <text class="t-arrow" x="612" y="836">连接 / 客户端 / HTTP</text>
+
+        <rect class="boundary" x="40" y="848" width="1120" height="130" rx="14" style="stroke: var(--muted)"/>
+        <text class="blabel" x="58" y="868">外部依赖 / 数据面 · docker compose（端口取自 .env）</text>
+
+        <rect class="b-db" x="60" y="882" width="170" height="86" rx="8"/>
+        <text class="t-title" x="145" y="908" text-anchor="middle">MySQL 8.0</text>
+        <text class="t-sub" x="145" y="928" text-anchor="middle">:3307 · rag_sbc</text>
+        <text class="t-sub" x="145" y="944" text-anchor="middle">FAQ / 会话 / 日志</text>
+
+        <rect class="b-db" x="245" y="882" width="170" height="86" rx="8"/>
+        <text class="t-title" x="330" y="908" text-anchor="middle">Redis 7</text>
+        <text class="t-sub" x="330" y="928" text-anchor="middle">:6380 · requirepass</text>
+        <text class="t-sub" x="330" y="944" text-anchor="middle">缓存 / 锁 / Stream</text>
+
+        <rect class="b-db" x="430" y="882" width="170" height="86" rx="8"/>
+        <text class="t-title" x="515" y="908" text-anchor="middle">Milvus 2.4</text>
+        <text class="t-sub" x="515" y="928" text-anchor="middle">edurag_v{N}</text>
+        <text class="t-sub" x="515" y="944" text-anchor="middle">HNSW + 稀疏倒排</text>
+
+        <rect class="b-db" x="615" y="882" width="155" height="86" rx="8"/>
+        <text class="t-title" x="692" y="908" text-anchor="middle">MinIO</text>
+        <text class="t-sub" x="692" y="928" text-anchor="middle">S3 兼容</text>
+        <text class="t-sub" x="692" y="944" text-anchor="middle">原始文档</text>
+
+        <rect class="b-ext" x="785" y="882" width="175" height="86" rx="8"/>
+        <text class="t-title" x="872" y="908" text-anchor="middle">GPU 模型</text>
+        <text class="t-sub" x="872" y="928" text-anchor="middle">BGE-M3 · Reranker</text>
+        <text class="t-sub" x="872" y="944" text-anchor="middle">意图 BERT · FP16 常驻</text>
+
+        <rect class="b-ext" x="975" y="882" width="165" height="86" rx="8"/>
+        <text class="t-title" x="1057" y="908" text-anchor="middle">LLM 网关</text>
+        <text class="t-sub" x="1057" y="928" text-anchor="middle">DeepSeek API</text>
+        <text class="t-sub" x="1057" y="944" text-anchor="middle">deepseek-flash</text>
+
+        <!-- ================= 图例 ================= -->
+        <rect class="b-backend" x="60" y="992" width="14" height="10" rx="2"/>
+        <text class="t-legend" x="80" y="1001">已实现</text>
+
+        <rect class="b-db" x="140" y="992" width="14" height="10" rx="2"/>
+        <text class="t-legend" x="160" y="1001">数据 / 存储</text>
+
+        <rect class="b-ext" x="240" y="992" width="14" height="10" rx="2"/>
+        <text class="t-legend" x="260" y="1001">外部服务</text>
+
+        <rect class="b-plan" x="340" y="992" width="14" height="10" rx="2"/>
+        <text class="t-legend" x="360" y="1001">待实现 / 进行中</text>
+
+        <rect class="b-frontend" x="490" y="992" width="14" height="10" rx="2"/>
+        <text class="t-legend" x="510" y="1001">前端</text>
+
+        <line class="arrow" x1="560" y1="997" x2="582" y2="997" marker-end="url(#arw)"/>
+        <text class="t-legend" x="590" y="1001">依赖 / 调用方向</text>
+      </svg>
+    </div>
+  </section>
+
+  <section class="cards">
+    <div class="card">
+      <div class="card-head">
+        <span class="dot" style="background: var(--db)"></span>
+        <h3>分层与依赖方向</h3>
+      </div>
+      <ul>
+        <li><strong>main.py（接入）→ 业务模块 → base/ → 外部服务</strong>，方向不可逆，反向 import 一律打回。</li>
+        <li><code>qa_system</code> 与 <code>rag_system</code> 互不 import，只通过 <code>base/contracts.py</code> 的数据类协作。</li>
+        <li>只有 <code>base/db.py</code> 与 <code>qa_system/res/qa_cache.py</code> 允许建连接，业务层拿 repository。</li>
+        <li>新增能力先判断归属：理解 / 检索 / 生成 / 知识 / 基础设施，放错层直接打回。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="dot" style="background: var(--backend)"></span>
+        <h3>在线请求链路</h3>
+      </div>
+      <ul>
+        <li>鉴权限流 20 ms → 归一化改写 80 ms → L1 精确缓存 10 ms。</li>
+        <li>FAQ ∥ 意图 ∥ 记忆召回并行 120 ms，<strong>三路各自独立超时</strong>，FAQ 不该被记忆拖慢。</li>
+        <li>检索 + 重排 350 ms → 证据门 5 ms → 生成吃剩余预算。</li>
+        <li>总预算 8 s；首 token p95 ≤ 1.2 s，完整答案 p95 ≤ 4 s。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="dot" style="background: var(--ext)"></span>
+        <h3>当前实现状态</h3>
+      </div>
+      <ul>
+        <li><strong>已跑通</strong>：qa_system 全链路（2000 条 FAQ）、rag 摄入 + 混合检索 + 证据门、763 条黄金集标定。</li>
+        <li><strong>进行中</strong>：意图 BERT 训练与评测，数据集 <code>06_intent</code> 六类各 850 条。</li>
+        <li><strong>待实现</strong>：<code>memory/</code>（仅有空包）、LangGraph 编排、WS 流式、Vue 前端。</li>
+        <li>意图训练脚本目前放在 <code>rag_system/core/</code>，按分层应迁入独立的 <code>understanding/</code>。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="dot" style="background: var(--frontend)"></span>
+        <h3>离线摄入链路</h3>
+      </div>
+      <ul>
+        <li>12 种后缀：md / txt / srt / docx / pptx / pdf / 图片 OCR，工厂按后缀分派。</li>
+        <li>父块 1200 / 子块 300，子块继承父块标题树；命中后按 <code>parent_id</code> 回填。</li>
+        <li><code>content_hash</code> 未变跳过；文档变更按 <code>source</code> 先删后写，不留脏块。</li>
+        <li>写入 <code>edurag_v{N}</code>，质检通过才切 alias；回滚 ≤ 30 s。</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer>
+    EduRAG-Pro 1.41 · 结构依据仓库当前代码（2026-10-24）· 虚线框为设计已定、尚未落地的模块
+  </footer>
+</div>
