@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from base.config import Settings, get_settings
+from base.contracts import Tier
 from base.logger import get_logger
 
 log = get_logger(__name__)
@@ -55,6 +56,10 @@ class CacheEntry:
     faq_id: int | None
     score: float
     reason: str
+    # 置信档（CLAUDE.md §7.1.9）。读回时**按它复原，不重新判定**——同一 query 不能因为
+    # margin 抖动在两档之间来回跳。None 表示旧版本写入的条目（没有这个字段），
+    # 上层必须按 low 处理并覆盖写，**不许猜成 high**。
+    tier: Tier | None = None
     subject: str | None = None
     matched_question: str | None = None
     # 负缓存也要带候选：未命中要交棒 RAG，候选列表是 RAG 做 query 扩展的输入，
@@ -68,6 +73,7 @@ class CacheEntry:
                 "faq_id": self.faq_id,
                 "score": self.score,
                 "reason": self.reason,
+                "tier": self.tier,
                 "subject": self.subject,
                 "matched_question": self.matched_question,
                 "candidates": [list(item) for item in self.candidates],
@@ -80,10 +86,13 @@ class CacheEntry:
     def from_json(cls, raw: str) -> "CacheEntry | None":
         try:
             data = json.loads(raw)
+            tier = data.get("tier")
             return cls(
                 faq_id=data.get("faq_id"),
                 score=float(data.get("score") or 0.0),
                 reason=str(data.get("reason") or ""),
+                # 只认三个合法值；缺字段/写坏了一律 None，由上层按 low 处理
+                tier=tier if tier in ("high", "mid", "low") else None,
                 subject=data.get("subject"),
                 matched_question=data.get("matched_question"),
                 candidates=tuple(

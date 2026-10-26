@@ -13,6 +13,8 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 
 from base.config import get_settings
+from base.labels import SUBJECT_ALIASES, SUBJECTS
+from qa_system.res import qa_slots
 from qa_system.res.qa_search import FAQService
 
 router = APIRouter(prefix="/v1/faq", tags=["faq"])
@@ -39,9 +41,27 @@ def _require_admin(token: str | None) -> str:
 async def search(
     request: Request,
     q: Annotated[str, Query(min_length=1, max_length=200, description="用户原始问题")],
-    subject: Annotated[str | None, Query(description="限定学科；不传则全学科检索")] = None,
+    subject: Annotated[
+        str | None, Query(description="限定学科；不传则全学科检索（见 CLAUDE.md §7.1.8）")
+    ] = None,
+    selected_faq_id: Annotated[
+        int | None,
+        Query(description="用户确认通道：mid 档追问被采纳后带上该 faq_id（见 CLAUDE.md §7.1.9）"),
+    ] = None,
 ) -> dict[str, Any]:
-    hit = await _service(request).search(q, subject=subject)
+    slots = qa_slots.from_param(subject)
+    if slots.subject_source == "invalid":
+        # 拼错学科是**参数错误**，不能悄悄退化成全库检索——否则调用方永远不知道过滤没生效
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "subject_invalid",
+                "subject": subject,
+                "allowed": list(SUBJECTS),
+                "aliases": sorted(SUBJECT_ALIASES),
+            },
+        )
+    hit = await _service(request).search(q, slots=slots, selected_faq_id=selected_faq_id)
     return hit.as_dict()
 
 

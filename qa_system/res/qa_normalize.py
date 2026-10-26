@@ -31,12 +31,38 @@ _TRAILING_PARTICLES = ("谢谢啦", "谢谢", "呢", "吗", "啊", "呀", "吧",
 
 _PUNCT = set(string.punctuation) | set("，。！？、；：“”‘’（）【】《》…—～·〈〉「」『』〔〕")
 
+# 数学运算符：只在"确实是算子"的位置保留（见 CLAUDE.md §7.1.2）。
+# 语料里有只差符号的题（x²-6x+9 / x²+6x+9、2/3-1/6 / 2/3+1/6），一律当标点删掉会让它们
+# 在精确哈希里撞成同一条，后者永远命中不到自己。同时把常见写法统一：× → *、÷ → /、· → *、− → -。
+_MATH_CANON = {"+": "+", "-": "-", "*": "*", "/": "/", "=": "=", "<": "<", ">": ">",
+               "×": "*", "÷": "/", "·": "*", "−": "-"}
+_OPEN_AFTER_OP = frozenset("([{")   # 算子的右邻可以是左括号：2*(3+4)
+_CLOSE_BEFORE_OP = frozenset(")]}")  # 算子的左邻可以是右括号：(a+b)-c
+_UNARY_LEFT = frozenset("([{|")      # 一元正负号只允许出现在开头或这些符号之后
+
+
 _CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 _UNITS = ("个", "年", "月", "周", "天", "小时", "分钟", "次", "期", "门", "种", "节", "人")
 _CN_NUM_RE = re.compile(rf"([{''.join(_CN_DIGITS)}])(?=(?:{'|'.join(_UNITS)}))")
 
 # 极简停用词：只去真正的语法词，学科名词一个都不能去
 _STOPWORDS = frozenset({"的", "是", "我", "你", "他", "她", "它", "吧", "呢", "吗", "啊", "和", "与", "及"})
+
+# 问句框架词：**只用于"这条问法是不是同一件事"的相似度比较**（语料重复合并、§7.1.7），
+# 不参与请求路径的归一化与 BM25 分词——那会改缓存 key 与 IDF，影响面远超去重。
+# 依据是实测分词："请解释什么是频数" → ['请','解释','什么','频数']、"频数指什么" → ['频数','指','什么']，
+# 框架去掉后三条问法都只剩 {频数}。
+QUESTION_FRAME_TOKENS = frozenset({
+    "什么", "是", "的", "指", "请", "请问", "解释", "介绍", "一下", "帮", "讲讲",
+    "如何", "怎样", "怎么样", "哪些", "吗", "呢", "吧", "呀", "讲", "说说", "谈谈",
+})
+
+
+def content_tokens(tokens: Iterable[str]) -> frozenset[str]:
+    """去掉问句框架词后的内容词集合；全被剥光时退回原集合（避免空集互撞）。"""
+    kept = frozenset(tok for tok in tokens if tok not in QUESTION_FRAME_TOKENS)
+    return kept or frozenset(tokens)
+
 
 # 口语同义词：单字替换安全（不碰学科名词），必须在 jieba 前做，
 # 否则"咋证明"会被切成生僻块，BM25 直接丢词。
@@ -63,8 +89,36 @@ def to_halfwidth(text: str) -> str:
     return unicodedata.normalize("NFKC", text)
 
 
+_SUPERSCRIPTS = frozenset("⁰¹²³⁴⁵⁶⁷⁸⁹")  # NFKC 之前也要认作操作数（x²-6x+9）
+
+
+def _is_operand(ch: str) -> bool:
+    """算子的操作数：ASCII 字母/数字（lower 在 strip 之后做，故大小写都算）与上标数字。"""
+    return bool(ch) and ((ch.isascii() and ch.isalnum()) or ch in _SUPERSCRIPTS)
+
+
 def strip_punct(text: str) -> str:
-    return "".join(ch for ch in text if ch not in _PUNCT and not ch.isspace())
+    """去标点与空白；数学表达式里的运算符按 §7.1.2 的规则保留。"""
+    compact = "".join(ch for ch in text if not ch.isspace())
+    out: list[str] = []
+    for i, raw in enumerate(compact):
+        op = _MATH_CANON.get(raw)
+        if op is None:
+            if raw not in _PUNCT:
+                out.append(raw)
+            continue
+        left = compact[i - 1] if i else ""
+        right = compact[i + 1] if i + 1 < len(compact) else ""
+        binary = (_is_operand(left) or left in _CLOSE_BEFORE_OP) and (
+            _is_operand(right) or right in _OPEN_AFTER_OP
+        )
+        # 一元正负号：开头、左括号、或绝对值符之后紧跟数字/字母（-5的绝对值 / (-5) / |-5|）
+        unary = op in "+-" and (i == 0 or left in _UNARY_LEFT) and _is_operand(right)
+        if binary or unary:
+            out.append(op)
+        elif raw not in _PUNCT:  # × ÷ − 本不在标点表里，保持原样，行为不变
+            out.append(raw)
+    return "".join(out)
 
 
 def normalize_numbers(text: str) -> str:

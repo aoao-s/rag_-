@@ -62,15 +62,32 @@ class Settings(BaseSettings):
 
     # ---- qa_system 参数（CLAUDE.md §7.1.2）----
     faq_threshold: float = Field(default=0.25, alias="FAQ_THRESHOLD")
+    # margin 的数值含义随 margin_mode 变：relative=(raw1-raw2)/raw1，normalized=score1-score2，raw=raw1-raw2。
+    # 重标定完成前保持 normalized（现网基线）；切 relative 必须重扫并写报告（§7.1.7 第三步）
     faq_margin: float = Field(default=0.10, alias="FAQ_MARGIN")
+    faq_margin_mode: str = Field(default="normalized", alias="FAQ_MARGIN_MODE")
+    # 三档路由的高置信下限（CLAUDE.md §7.1.9）：与 FAQ_MARGIN **同一 margin_mode 空间**解释。
+    # 过 ①②③ 且 margin ≥ 它才是 high（唯一允许直接作答的一档）；[FAQ_MARGIN, 它) 是 mid，
+    # 只交 RAG + 追问，不返回答案。设成与 FAQ_MARGIN 相等即精确回退为单档——灰度和回滚都靠它，不改代码。
+    faq_high_margin: float = Field(default=0.22, alias="FAQ_HIGH_MARGIN")
+    # 候选数下限：只有 1 条候选时"领先第二名"不成立，直接不算命中（§7.1.2 判据 ②）
+    faq_min_candidates: int = Field(default=2, alias="FAQ_MIN_CANDIDATES")
+    # 多学科场景：主学科 best 与另一学科 best 的归一化分差下限（跨学科只比归一化分）
+    faq_cross_subject_delta: float = Field(default=0.05, alias="FAQ_CROSS_SUBJECT_DELTA")
     faq_top_k: int = Field(default=20, alias="FAQ_TOP_K")
     faq_norm_k: float = Field(default=12.0, alias="FAQ_NORM_K")
     faq_candidate_n: int = Field(default=3, alias="FAQ_CANDIDATE_N")
     faq_alias_enabled: bool = Field(default=True, alias="FAQ_ALIAS_ENABLED")
+    # 语料重复合并（§7.1.7 语料重复合并契约）：同学科 + 答案逐字相同 + 去问句框架词后 Jaccard ≥0.8 的 FAQ
+    # 并成一条，只留最小 faq_id 进 BM25 索引，其余登记为精确命中别名。
+    # "什么是X" 与 "X是什么" 的 BM25 分数一分不差，任何同义问法都会撞出 margin 0、两条都答不了。
+    # 置 false 只用于对照实验，生产保持 true。
+    faq_dedupe_near_dup: bool = Field(default=True, alias="FAQ_DEDUPE_NEAR_DUP")
     faq_admin_token: str = Field(default="", alias="FAQ_ADMIN_TOKEN")
     # 本地无数据库时从 CSV 装载语料（相对仓库根目录）；生产留空，走 MySQL 真相源
     faq_corpus_csv: str = Field(default="", alias="FAQ_CORPUS_CSV")
-
+    # -----model意图识别模型路径
+    MODELS_DIR:Path=Field(default="",alias="MODELS_DIR")
     # ---- 启动行为 ----
     # dev 下允许数据库不可用时以"空 FAQ 语料"启动，便于纯本地跑通链路；生产必须关闭
     allow_degraded_start: bool = Field(default=True, alias="ALLOW_DEGRADED_START")
@@ -214,6 +231,16 @@ class Settings(BaseSettings):
             problems.append(f"FAQ_THRESHOLD={self.faq_threshold} 必须在 (0,1) 之间")
         if self.faq_margin < 0:
             problems.append("FAQ_MARGIN 不能为负")
+        if self.faq_margin_mode not in ("relative", "normalized", "raw"):
+            problems.append(f"FAQ_MARGIN_MODE={self.faq_margin_mode} 必须是 relative/normalized/raw")
+        # 三档是"中置信不许直接答"，高置信线低于命中线会让 mid 区间为空、配置自相矛盾
+        if self.faq_high_margin < self.faq_margin:
+            problems.append(
+                f"FAQ_HIGH_MARGIN={self.faq_high_margin} 不能小于 FAQ_MARGIN={self.faq_margin}"
+                "（两者同一 margin_mode 空间；相等即回退为单档）"
+            )
+        if self.faq_min_candidates < 1:
+            problems.append("FAQ_MIN_CANDIDATES 必须 ≥1")
         if self.faq_top_k <= 0:
             problems.append("FAQ_TOP_K 必须为正")
         return problems

@@ -28,9 +28,9 @@ MESSAGES: dict[str, str] = {
     "http_request": "HTTP {method} {path} -> {status} [{latency_ms}ms]",
 
     # ---- 检索：一行结论，必须能看出命中来源 ------------------------------
-    "faq_search_hit": "检索命中 [来源: {source_cn}] {q_text} | faq_id: {faq_id} | 学科: {subject} | 得分: {score} | 耗时: {latency_ms}ms",
-    "faq_search_miss": "检索未命中 [来源: {source_cn}] {q_text} | 原因: {reason} | 最高得分: {score} (阈值: {threshold}) | 分差: {margin} | 候选: {candidates} | 耗时: {latency_ms}ms",
-    "faq_handoff_rag": "FAQ 未命中，转交 RAG 检索 {q_text} | 候选问题: {candidates}",
+    "faq_search_hit": "检索命中 [来源: {source_cn}] {q_text} | 档位: {tier} | faq_id: {faq_id} | 学科: {subject} | 得分: {score} | 耗时: {latency_ms}ms",
+    "faq_search_miss": "检索未命中 [来源: {source_cn}] {q_text} | 档位: {tier} | 原因: {reason} | 最高得分: {score} (阈值: {threshold}) | 分差: {margin} | 候选: {candidates} | 耗时: {latency_ms}ms",
+    "faq_handoff_rag": "FAQ 未命中，转交 RAG 检索 {q_text} | 档位: {tier} | 候选问题: {candidates}",
     "faq_search_query": "查询原文: [{q}]",
     "faq_no_evidence": "无可用语料，直接转交 RAG 检索 {q_text}",
 
@@ -42,6 +42,7 @@ MESSAGES: dict[str, str] = {
     "faq_cache_stale": "Redis 缓存指向的 FAQ 已下线，按未命中重算 [faq_id: {faq_id}, 版本: {version}]",
     "faq_cache_expired_absolute": "Redis 缓存超过绝对寿命，强制回源 [Key: {key}, 存活: {age_s}s]",
     "faq_cache_bad_value": "Redis 缓存值损坏，按未命中处理 [Key: {key}]",
+    "faq_cache_no_tier": "Redis 缓存条目缺置信档（旧版本写入），按低置信重算并覆盖写 [faq_id: {faq_id}]",
     "faq_cache_get_failed": "Redis 读取失败，降级走索引 [错误: {error}]",
     "faq_cache_put_failed": "Redis 写入失败，忽略本次回填 [错误: {error}]",
     "faq_cache_slide_failed": "Redis 续命失败，忽略 [错误: {error}]",

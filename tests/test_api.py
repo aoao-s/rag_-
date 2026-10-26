@@ -14,7 +14,9 @@ from qa_system.res.qa_db import FAQRecord, InMemoryFAQRepository
 from qa_system.res.qa_search import FAQService
 
 
-def _make_app(records: list[FAQRecord] | None = None) -> FastAPI:
+def _make_app(
+    records: list[FAQRecord] | None = None, *, policy: MatchPolicy | None = None
+) -> FastAPI:
     repo = InMemoryFAQRepository(
         records
         or [
@@ -22,7 +24,7 @@ def _make_app(records: list[FAQRecord] | None = None) -> FastAPI:
             FAQRecord(2, "数学", "勾股定理怎么证明？", "面积法。"),
         ]
     )
-    service = FAQService(repo, policy=MatchPolicy(threshold=0.3, margin=0.0))
+    service = FAQService(repo, policy=policy or MatchPolicy(threshold=0.3, margin=0.0))
     asyncio.run(service.load())
 
     app = FastAPI()
@@ -90,3 +92,43 @@ def test_admin_endpoints_open_in_dev_without_token(path: str) -> None:
     # FAQ_ADMIN_TOKEN 未配置时允许本机调试（生产必须配置，见 api/faq.py）
     assert _call(_make_app(), "GET", path).status_code == 200
 
+
+
+def test_invalid_subject_returns_400_with_allowed_list() -> None:
+    # 拼错学科是参数错误，不能悄悄退化成全库检索（CLAUDE.md §7.1.8）
+    resp = _call(_make_app(), "GET", "/v1/faq/search", params={"q": "勾股定理", "subject": "物理课"})
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["error"] == "subject_invalid" and "数学" in detail["allowed"]
+
+
+def test_valid_subject_without_data_is_not_500() -> None:
+    resp = _call(_make_app(), "GET", "/v1/faq/search", params={"q": "勾股定理", "subject": "化学"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["reason"] == "subject_empty" and body["subject_state"] == "empty"
+
+
+def test_subject_alias_is_accepted() -> None:
+    app = _make_app([FAQRecord(9, "道德与法治", "政治课学什么", "宪法与公民权利。")])
+    resp = _call(app, "GET", "/v1/faq/search", params={"q": "政治课学什么", "subject": "政治"})
+    assert resp.status_code == 200
+    assert resp.json()["subject"] == "道德与法治"
+
+
+def test_selected_faq_id_confirms_mid_hit() -> None:
+    # 确认通道（§7.1.9）：mid 追问被采纳后带 selected_faq_id 重发，直接返回该条答案
+    policy = MatchPolicy(threshold=0.05, margin=0.0, margin_mode="relative", high_margin=0.99)
+    app = _make_app(policy=policy)
+
+    mid = _call(app, "GET", "/v1/faq/search", params={"q": "勾股定理的证明方法"}).json()
+    assert mid["tier"] == "mid" and mid["hit"] is False and mid["answer"] is None
+
+    confirmed = _call(
+        app,
+        "GET",
+        "/v1/faq/search",
+        params={"q": "勾股定理的证明方法", "selected_faq_id": mid["faq_id"]},
+    ).json()
+    assert confirmed["tier"] == "high" and confirmed["hit"] is True
+    assert confirmed["reason"] == "user_confirmed" and confirmed["answer"]

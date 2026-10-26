@@ -44,6 +44,26 @@ class TestNormalize:
     def test_strip_punct_keeps_words(self) -> None:
         assert strip_punct("数学（必修）") == "数学必修"
 
+    def test_math_operators_kept_between_operands(self) -> None:
+        # 只差符号的题目必须归一成不同串，否则精确哈希撞车、后者永远命中不到自己（§7.1.2）
+        assert strip_punct("因式分解 x²-6x+9") == "因式分解x²-6x+9"
+        assert strip_punct("2/3-1/6") == "2/3-1/6"
+        assert strip_punct("(a+b)-c") == "a+b-c"
+        assert strip_punct("x>3") == "x>3"
+
+    def test_math_operator_canonicalized(self) -> None:
+        assert strip_punct("2×3") == strip_punct("2*3")
+        assert strip_punct("6÷2") == strip_punct("6/2")
+
+    def test_math_operator_dash_separator_still_removed(self) -> None:
+        # 两侧不是 ASCII 操作数时仍是分隔符，不能被当成算子保留（"数学-七年级" → "数学七年级"）
+        assert strip_punct("数学-七年级") == "数学七年级"
+        assert strip_punct("学费+住宿费") == "学费住宿费"
+
+    def test_unary_minus_kept(self) -> None:
+        assert strip_punct("-5的绝对值") == "-5的绝对值"
+        assert strip_punct("|-5|") == "-5"
+
     def test_normalize_numbers_only_with_unit(self) -> None:
         assert normalize_numbers("一二三") == "一二三"
         assert normalize_numbers("三门课") == "3门课"

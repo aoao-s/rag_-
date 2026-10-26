@@ -46,6 +46,16 @@ REASON_ZH = {
     "exact": "精确命中（与原问题归一化后一致）",
     "alias_exact": "别名命中（同义词表折算后一致）",
     "ok": "相似命中（分数与领先幅度均达标）",
+    "mid_confidence": "中置信：过阈值但领先幅度不够，只给候选与追问，不直接作答",
+    "multi_scope_handoff": "中置信：多学科打平，交 RAG + 追问（跨学科 delta 未标定）",
+    "cross_subject_ambiguous": "中置信：两个学科分数太接近，交 RAG + 追问",
+    "subject_inferred_handoff": "中置信：学科是推断的，交 RAG + 追问",
+    "subject_context_handoff": "中置信：学科来自上下文，交 RAG + 追问",
+    "subject_conflict_handoff": "中置信：规则与模型学科结论冲突，交 RAG",
+    "subject_invalid_handoff": "中置信：学科参数非法（已全线兜底），交 RAG + 追问",
+    "user_confirmed": "用户确认命中（追问被采纳）",
+    "single_candidate": "未命中：只有一个候选，谈不上领先",
+    "subject_empty": "未命中：该学科没有语料（不兜底成全库）",
     "below_threshold": "未命中：最高分低于阈值",
     "ambiguous": "未命中：top1 与 top2 太接近（同题族，不能猜）",
     "no_match": "未命中：一个词都没对上，整句交给 RAG",
@@ -73,6 +83,7 @@ def build_policy(settings) -> MatchPolicy:
         margin=settings.faq_margin,
         candidate_n=settings.faq_candidate_n,
         norm_k=settings.faq_norm_k,
+        high_margin=settings.faq_high_margin,  # §7.1.9 三档；等于 margin 即单档
     )
 
 
@@ -149,6 +160,7 @@ async def build_service(*, use_csv: bool, limit: int | None) -> FAQService:
         cache_negative_ttl=settings.faq_cache_negative_ttl,
         cache_prefix=f"edurag:{settings.app_env}",
         log_query=settings.log_query_text,
+        dedupe_near_dup=settings.faq_dedupe_near_dup,
     )
     info = await service.load()
     await service.warmup()
@@ -164,7 +176,7 @@ def reason_text(reason: str) -> str:
 
 
 def print_hit(query: str, hit: FAQHit, subject: str | None) -> None:
-    flag = "命中" if hit.hit else "未命中"
+    flag = {"high": "命中", "mid": "中置信", "low": "未命中"}.get(hit.tier, hit.tier)
     source = SOURCE_ZH.get(hit.source, hit.source or "未知")
     cache_note = {
         "hit": "缓存命中，未回源",
@@ -188,6 +200,9 @@ def print_hit(query: str, hit: FAQHit, subject: str | None) -> None:
         print(f"答案：{hit.answer}")
         print("-" * 60)
     elif hit.candidates:
+        if hit.tier == "mid" and hit.matched_question:
+            # 中置信的唯一"好处"：有一个可信的追问对象（top1），答案仍必须走 RAG 或用户确认
+            print(f"追问：你是不是想问「{hit.matched_question}」？(faq_id={hit.faq_id})")
         print("候选（交给 RAG 做 query 扩展）：")
         for idx, cand in enumerate(hit.candidates, start=1):
             print(f"  {idx}. [{cand.score:.4f}] {cand.question}  (faq_id={cand.faq_id})")

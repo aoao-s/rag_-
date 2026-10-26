@@ -105,6 +105,8 @@ class Container:
             cache_negative_ttl=s.faq_cache_negative_ttl,
             cache_prefix=f"edurag:{s.app_env}",
             log_query=s.log_query_text,
+            cross_subject_delta=s.faq_cross_subject_delta,
+            dedupe_near_dup=s.faq_dedupe_near_dup,
         )
 
     async def load_faq(self) -> None:
@@ -219,6 +221,10 @@ def _policy_from(settings: Settings):
         margin=settings.faq_margin,
         candidate_n=settings.faq_candidate_n,
         norm_k=settings.faq_norm_k,
+        min_candidates=settings.faq_min_candidates,
+        margin_mode=settings.faq_margin_mode,  # type: ignore[arg-type]
+        # 三档路由的高置信下限（§7.1.9）；等于 faq_margin 即回退为单档
+        high_margin=settings.faq_high_margin,
     )
 
 
@@ -348,6 +354,13 @@ async def metrics(request: Request) -> Response:
             "# TYPE edurag_faq_cache_errors_total counter",
             f"edurag_faq_cache_errors_total {stats['cache_errors']}",
         ]
+        # 三档路由计数（§7.1.9）：与 routes 分开——一个是"查了多大范围"，一个是"结论有多可信"
+        for tier, note in (("high", "高置信可直接作答"), ("mid", "中置信只给候选与追问"), ("low", "低置信交棒 RAG")):
+            lines += [
+                f"# HELP edurag_faq_route_{tier}_total {note}",
+                f"# TYPE edurag_faq_route_{tier}_total counter",
+                f"edurag_faq_route_{tier}_total {stats['tiers'].get(tier, 0)}",
+            ]
     rag = container.rag if container else None
     if rag is not None:
         lines += [
