@@ -1,0 +1,70 @@
+{
+  "generated_at": "2026-10-26T23:50:05",
+  "corpus": {
+    "path": "datasets\\04_faq\\edu_faq.csv",
+    "csv_sha256": "35a0955014d662f977fb6cc7d76b28ae7063a017353f089b476b0a42aff30a74",
+    "records_sha256": "a4c7248697b4a6f8c1737b42c40970631ebd22c5e618f2cec379bd0dcb5ededa",
+    "records": 2000,
+    "subjects": {
+      "数学": 605,
+      "物理": 310,
+      "化学": 237,
+      "生物": 184,
+      "英语": 163,
+      "语文": 162,
+      "历史": 134,
+      "地理": 108,
+      "道德与法治": 97
+    }
+  },
+  "normalizer": {
+    "probes": 12,
+    "sha256": "43c4f1911a33ce2987f90d8c32b2a5793102fe013c4364c76056f78f9de45cda",
+    "samples": {
+      "请问一下，学费多少钱？": "学费多少钱",
+      "学三个月": "学3个月",
+      "勾股定理咋证明": "勾股定理怎么证明",
+      "ＢＥＲＴ模型": "bert模型",
+      "因式分解 x²-6x+9": "因式分解x2-6x+9",
+      "2/3-1/6": "2/3-1/6",
+      "2×3": "2*3",
+      "|-5|": "-5",
+      "数学-七年级": "数学7年级",
+      "学费+住宿费": "学费住宿费",
+      "H₂SO₄ 与 h2so4": "h2so4与h2so4",
+      "第3-5题": "第3-5题"
+    }
+  },
+  "index": {
+    "docs": 2000,
+    "indexed": 1374,
+    "merged_duplicates": 626,
+    "subjects": [
+      "化学",
+      "历史",
+      "地理",
+      "数学",
+      "物理",
+      "生物",
+      "英语",
+      "语文",
+      "道德与法治"
+    ],
+    "unlabeled": 0,
+    "version": 1,
+    "built_at": "2026-10-26T23:50:04"
+  },
+  "policy": {
+    "threshold": 0.25,
+    "margin": 0.1,
+    "margin_mode": "normalized",
+    "norm_k": 12.0,
+    "min_candidates": 2
+  },
+  "self_check": {
+    "total": 2000,
+    "hit_self": 2000,
+    "misses": []
+  },
+  "duplicates": []
+}
