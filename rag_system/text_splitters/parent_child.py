@@ -53,10 +53,36 @@ def split_sentences(text: str) -> list[str]:
     return [p for p in parts if p.strip()]
 
 
+def _hard_split(sent: str, size: int, overlap: int) -> list[str]:
+    """把**单句**切成不超过 size 的片段（相邻片段留 overlap 字符重叠）。
+
+    为什么必须有这一层：`_pack` 只在"句"之间装箱，一句超过 size 时整句进块。
+    教材语料里这种"句子"很常见——MinerU 解析出来的表格行、公式行、无句号的标题串，
+    几千字一个换行都没有。2026-10-29 实测：`10_exam_papers` 语料切出过 **12 140 字**的子块，
+    被 Milvus 的 `text` 字段（`max_length=4096`）整份拒收，教材入库直接失败。
+
+    在切分层兜住，而不是在写库层静默截断：截断丢掉的正是引用要定位的那半句，
+    "写进去了但对不上原文"比"写不进去"更难查。
+    """
+    if len(sent) <= size:
+        return [sent]
+    step = max(1, size - overlap)  # overlap ≥ size 时退化为逐字滑窗，至少保证前进
+    pieces: list[str] = []
+    for i in range(0, len(sent), step):
+        pieces.append(sent[i : i + size])
+        if i + size >= len(sent):
+            break
+    # 尾片整段落在上一片的 overlap 里时丢掉：重复内容只会喂给 embedding 两遍
+    if len(pieces) > 1 and len(pieces[-1]) <= overlap:
+        pieces.pop()
+    return pieces
+
+
 def _pack(sentences: list[str], size: int, overlap: int, min_size: int) -> list[str]:
     """把句子贪婪装箱到 size 字符；相邻块之间留 overlap 字符的句子重叠。"""
     if not sentences:
         return []
+    sentences = [piece for sent in sentences for piece in _hard_split(sent, size, overlap)]
     chunks: list[str] = []
     buf: list[str] = []
     length = 0

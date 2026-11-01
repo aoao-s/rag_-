@@ -16,7 +16,6 @@ from rag_system.document_loaders.base import LoadedDoc, BaseDocumentLoader, gues
 _SRT_TIME = re.compile(r"^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->")
 _SRT_INDEX = re.compile(r"^\d+$")
 _FRONT_MATTER = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
-_SUBJECTS = ("语文", "数学", "英语", "物理", "化学", "生物", "历史", "地理", "政治")
 
 
 def strip_front_matter(text: str) -> str:
@@ -44,7 +43,7 @@ class TextLoader(BaseDocumentLoader):
             text=text,
             source=str(p),
             doc_type=self.doc_type,
-            subject=guess_subject(p.name, _SUBJECTS),
+            subject=guess_subject(str(p)),
             title=p.stem,
             meta={"suffix": p.suffix.lower(), "chars": len(text)},
         )
@@ -70,7 +69,7 @@ class SubtitleLoader(BaseDocumentLoader):
             text=text,
             source=str(p),
             doc_type="subtitle",
-            subject=guess_subject(p.name, _SUBJECTS),
+            subject=guess_subject(str(p)),
             title=p.stem,
             meta={"suffix": ".srt", "chars": len(text)},
         )

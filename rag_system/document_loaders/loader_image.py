@@ -13,7 +13,6 @@ from pathlib import Path
 from rag_system.document_loaders.base import BaseDocumentLoader, LoadedDoc, LoaderError, guess_subject
 from rag_system.document_loaders.ocr import ocr_available, ocr_image_bytes
 
-_SUBJECTS = ("语文", "数学", "英语", "物理", "化学", "生物", "历史", "地理", "政治")
 
 
 class ImageLoader(BaseDocumentLoader):
@@ -34,7 +33,7 @@ class ImageLoader(BaseDocumentLoader):
             text=text,
             source=str(p),
             doc_type="image",
-            subject=guess_subject(p.name, _SUBJECTS),
+            subject=guess_subject(str(p)),
             title=p.stem,
             meta={"bytes": len(data)},
         )

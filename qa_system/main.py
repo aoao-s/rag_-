@@ -161,6 +161,7 @@ async def build_service(*, use_csv: bool, limit: int | None) -> FAQService:
         cache_prefix=f"edurag:{settings.app_env}",
         log_query=settings.log_query_text,
         dedupe_near_dup=settings.faq_dedupe_near_dup,
+        tenant_id=settings.tenant_id,
     )
     info = await service.load()
     await service.warmup()

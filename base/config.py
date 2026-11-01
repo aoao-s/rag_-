@@ -93,9 +93,11 @@ class Settings(BaseSettings):
     allow_degraded_start: bool = Field(default=True, alias="ALLOW_DEGRADED_START")
 
     # ---- 文档与切分（CLAUDE.md §7.2 知识库）----
-    # 待入库的原始资料目录：相对仓库根目录，逗号分隔可写多个
+    # 待入库的原始资料目录：相对仓库根目录，逗号分隔可写多个。
+    # 2026-10-29 起语料换成按 `阶段/学科/年级/` 组织的一体化目录（教材/教案/试卷/题库/复习卷
+    # 都在这一个根下，`doc_type` 由文件名推断），旧的 `01_textbook` 等平铺目录不再默认入库。
     rag_docs_dir: str = Field(
-        default="datasets/01_textbook,datasets/02_lesson_plans,datasets/08_subtitles",
+        default="datasets/初高中教材教案试卷-按年级",
         alias="RAG_DOCS_DIR",
     )
     # 父块：语义完整、随答案一起进 prompt；子块：只用来被检索命中
@@ -103,12 +105,25 @@ class Settings(BaseSettings):
     rag_parent_overlap: int = Field(default=100, alias="RAG_PARENT_OVERLAP")
     rag_child_size: int = Field(default=300, alias="RAG_CHILD_SIZE")
     rag_child_overlap: int = Field(default=20, alias="RAG_CHILD_OVERLAP")
-    # 单篇文档最多产出多少子块，防止一份几百页的 PDF 把库撑爆
-    rag_max_chunks_per_doc: int = Field(default=2000, alias="RAG_MAX_CHUNKS_PER_DOC")
+    # 单篇文档最多产出多少子块，防止一份畸形文件把库撑爆。
+    # 2026-10-29 由 2000 上调：一份学科题库（`题库.json`，渲染后 78 万字符）按 300 字子块切
+    # 就有 2600 块，2000 会把最后 1/4 的题目**静默截断**（只留一条 `ingest_truncated` 日志）。
+    # 这是个"防炸"阈值，不是质量旋钮，定低了就是在删语料。
+    rag_max_chunks_per_doc: int = Field(default=8000, alias="RAG_MAX_CHUNKS_PER_DOC")
     # PDF 解析器：auto=有 MINERU_TOKEN 走云解析、失败自动退本地；mineru=只用云；local=只用 PyMuPDF
     rag_pdf_parser: str = Field(default="auto", alias="RAG_PDF_PARSER")
     # Office/图片里的内嵌图是否 OCR：慢且贵，默认关闭（教材 PDF 走 MinerU 自带版面解析）
     rag_ocr_images: bool = Field(default=False, alias="RAG_OCR_IMAGES")
+
+    # ---- 近重复文档检测（CLAUDE.md §7.2.6「未做」项的落地）----
+    # 同一本教材的两次下载会让同一段证据以"两篇文档"的身份互为对手，
+    # 证据门的跨文档 margin 直接判 ambiguous。`datasets/` 只读，只能在摄入侧拒绝。
+    rag_dedup_enabled: bool = Field(default=True, alias="RAG_DEDUP_ENABLED")
+    # 64 位 simhash 的汉明距离上限：3 能拦住"换页眉/换标点"的同一份文档，
+    # 又不会把同一学科的两本不同教材判成重复（实测不同教材距离普遍 >12）
+    rag_dedup_distance: int = Field(default=3, alias="RAG_DEDUP_DISTANCE")
+    # 取正文前多少个字符算指纹：两次下载的差异常在页眉水印上，取开头即可覆盖
+    rag_dedup_prefix_chars: int = Field(default=8000, alias="RAG_DEDUP_PREFIX_CHARS")
 
     # ---- 在线检索与重排 ----
     # 关闭后 /v1/rag/* 直接 503，编排层只走 FAQ（本地没有 Milvus 时用）
@@ -124,8 +139,11 @@ class Settings(BaseSettings):
     # 送入重排的父块截断字符数，约等于 512 token
     rag_rerank_chars: int = Field(default=2000, alias="RAG_RERANK_CHARS")
     rag_rerank_max_length: int = Field(default=512, alias="RAG_RERANK_MAX_LENGTH")
+    # 权重放在**本仓库**的 `rag_system/models/`（2026-10-29 从上级旧仓库 `../Ragpro` 迁出）。
+    # 指向别的仓库时，交付机上没有那份目录，`build_embedder` 只会 warn 一句然后**静默退成
+    # HashEmbedder**——检索质量断崖式下降而服务照常 200，是最难发现的一类事故。
     rag_reranker_path: str = Field(
-        default="../Ragpro/rag_system/models/BAAI/bge-reranker-v2-m3", alias="RAG_RERANKER_PATH"
+        default="rag_system/models/BAAI/bge-reranker-v2-m3", alias="RAG_RERANKER_PATH"
     )
     # 重排模型用 fp16 需要 GPU；CPU 上 fp16 会直接报错
     rag_use_fp16: bool = Field(default=True, alias="RAG_USE_FP16")
@@ -140,10 +158,206 @@ class Settings(BaseSettings):
     # 问句实词在 top1 证据里的最低覆盖率：挡"同主题但没答这个问题"的块
     rag_evidence_qcov: float = Field(default=0.20, alias="RAG_EVIDENCE_QCOV")
 
+    # ---- 检索边界（§7.2.7-A）----
+    # 安全三项一律以 Milvus 标量过滤下推，**不允许**在检索后用 Python 过滤（§5.6 第 5 条），
+    # 也**不允许**被"放宽业务过滤"的修复动作清掉（`RetrievalFilters.relaxed()` 只清
+    # subjects / doc_types）。改了 `KB_VERSION` 等于换一代索引，缓存 key 随之自然失效。
+    kb_version: str = Field(default="v1", alias="KB_VERSION")
+    tenant_id: str = Field(default="default", alias="TENANT_ID")
+
+    # ---- 生成层：LLM 网关（CLAUDE.md §7.8）----
+    # 走 OpenAI 兼容协议，换供应商只改 base_url / model，不改代码。
+    # 为空时**不阻断启动**：/v1/chat 走兜底话术，FAQ 与 RAG 照常；生产用 ALLOW_DEGRADED_START=false 兜住。
+    llm_api_key: str = Field(default="", alias="LLM_API_KEY")
+    llm_base_url: str = Field(default="https://api.deepseek.com", alias="LLM_BASE_URL")
+    llm_qa_model: str = Field(default="deepseek-chat", alias="LLM_QA_MODEL")
+    # 首 token / 连接失败时换这个模型（空 = 不换）。换模型算降级，不算重试（§5.3）
+    llm_fallback_model: str = Field(default="", alias="LLM_FALLBACK_MODEL")
+    # 路由/改写模型留给 PR5，先占位，避免以后再改一遍环境变量
+    llm_router_model: str = Field(default="deepseek-chat", alias="LLM_ROUTER_MODEL")
+    llm_timeout_s: int = Field(default=60, alias="LLM_TIMEOUT_S")
+    llm_max_tokens: int = Field(default=1024, alias="LLM_MAX_TOKENS")
+    llm_temperature: float = Field(default=0.2, alias="LLM_TEMPERATURE")
+    # 网关级有限重试：**只覆盖传输层故障**（超时 / 连接中断 / HTTP 408 / 429）。
+    # 这与 §5.3「生成节点不重试」不冲突，两者管的是不同层级：
+    #   - 节点级不重试 = 不把整条检索 + 生成链再跑一遍（那会翻倍吃预算、翻倍计费）；
+    #   - 网关级有限重试 = 一个字都还没生成前的**同一次请求**重发，最多 `LLM_MAX_RETRIES` 次。
+    # 4xx（含 401/403）与 5xx 不在这里重试：前者重试也不会好，后者直接换模型更划算（§7.8）。
+    llm_max_retries: int = Field(default=1, alias="LLM_MAX_RETRIES")
+
+    # ---- 生成层：本地小模型（闲聊档专用，§7.7）----
+    # 闲聊既不需要知识库证据，也不需要大模型的推理能力：一句"你好"付一次云端往返与计费不划算。
+    # 这里单独给一条本地端点（Ollama 的 OpenAI 兼容层），**与主网关完全独立**——
+    # 端点 / 模型 / key / 超时各自一份。不能靠 `model=` 参数复用一个网关：网关的
+    # `base_url`、key、`enabled`、超时全部绑在 `Settings` 上，换模型仍然打到云端 base_url、
+    # 发云端 key，而没有 cloud key 的本地端点会被 `enabled` 判成"永久不可用"。
+    llm_local_base_url: str = Field(
+        default="http://127.0.0.1:11434/v1", alias="LLM_LOCAL_BASE_URL"
+    )
+    llm_local_model: str = Field(default="qwen3.5:0.8b", alias="LLM_LOCAL_MODEL")
+    # 本地 Ollama 不校验 key；留空时不发 Authorization 头（空 Bearer 反而可能被某些代理拒掉）
+    llm_local_api_key: str = Field(default="", alias="LLM_LOCAL_API_KEY")
+    # 比云端短：本地小模型要么很快，要么就是卡住了，等 60 s 没有意义
+    llm_local_timeout_s: int = Field(default=30, alias="LLM_LOCAL_TIMEOUT_S")
+    # qwen3.5:0.8b 是**思考型**模型：默认把 token 全花在 reasoning 上、`content` 恒为空
+    # （本机实测 max_tokens=1024 时 `finish_reason=length` / reasoning 4302 字 / content=''），
+    # 直接接进来每一轮闲聊都会被 `_extract_text` 判成"LLM 返回空答案"而走兜底。
+    # 实测只有 `reasoning_effort: "none"` 被 `/v1/chat/completions` 认（`think:false` 与
+    # `chat_template_kwargs.enable_thinking` 都被静默忽略）。置空 = 不发这个字段。
+    llm_local_reasoning_effort: str = Field(
+        default="none", alias="LLM_LOCAL_REASONING_EFFORT"
+    )
+
+    # ---- 编排层（/v1/chat）----
+    # 单请求总预算：生成拿剩余部分，超了截断/兜底（§6.1）
+    total_budget_ms: int = Field(default=8000, alias="TOTAL_BUDGET_MS")
+    # 句级引用支持度下限：句子实词被所引证据覆盖的比例低于它就算"无支撑句"（§7.8）
+    citation_min_support: float = Field(default=0.30, alias="CITATION_MIN_SUPPORT")
+    # 兜底话术里的联系方式；留空就只说"转人工"，不要编造电话号码
+    chat_support_contact: str = Field(default="", alias="CHAT_SUPPORT_CONTACT")
+    # 意图档位开关（§5.3 每个节点都能单独关掉）。关掉等于 §7.7 A/B 里的"全量 DIRECT 基线"：
+    # 不按 doc_type 收窄、不跳过检索，用于灰度与回滚，不改代码。
+    feature_intent: bool = Field(default=True, alias="FEATURE_INTENT")
+    # 意图识别改用大模型（§7.7）：与查询改写**合并成一次调用**，位置在 FAQ 未命中之后。
+    # 关掉回落到 `understanding/intent.py` 的规则分类器——规则版是 §7.8.4 A/B 的基线，
+    # 两条路径的 F1 不可互换，切换时要重新量。
+    feature_intent_llm: bool = Field(default=True, alias="FEATURE_INTENT_LLM")
+    # BERT 精调分类器做**初始**意图（任务 2.2，CLAUDE.md §7.7）：
+    # 置信度够就直接定档，一次大模型调用都不发；不够才把意图交给大模型辅助判断。
+    # 关掉（或检查点缺失 / 标签映射对不上）时整条链路退回"大模型 → 规则"，
+    # 与加这个开关之前**逐字节一致**——这是它作为回滚开关的含义。
+    feature_intent_bert: bool = Field(default=True, alias="FEATURE_INTENT_BERT")
+    # BERT 推理的硬上限：CPU 上单条 forward 是毫秒级，超过 200 ms 说明线程池被占满
+    # （torch 在跑别的活），这时宁可放弃这条结论让大模型接手，也别拖住首 token
+    intent_bert_timeout_ms: int = Field(default=200, alias="INTENT_BERT_TIMEOUT_MS")
+
+    # 大模型查询改写。`false` 时只保留确定性归一化（NFKC/空白/标点），不花任何一次调用
+    feature_query_rewrite: bool = Field(default=True, alias="FEATURE_QUERY_REWRITE")
+    # 年级/学段下推成 Milvus 标量过滤（§7.2.7-E）。年级误抽（"八年级的题高一还会考吗"）
+    # 会把高一文档挡在外面，一键回滚用这个开关
+    feature_grade_filter: bool = Field(default=True, alias="FEATURE_GRADE_FILTER")
+    # HyDE（阶段 4.3）：短且抽象的问句先让模型写一段"假设性答案"，再拿它去检索。
+    # **2026-11-01 默认打开**（用户决定：HyDE 交给 DeepSeek 做）。如实记录两件事：
+    # ① 它会多付**一次生成调用**，正好压在首 token 预算里（§6.1 的 1.2 s SLO 尚未重测）；
+    # ② "打开后召回变好"仍然**没有任何评估数据**——§5.4 要求的黄金集对照报告没跑过，
+    #    所以这是一个按需求打开的实验性能力，不是已验证的优化。回滚开关就是这一行。
+    # 无论开关如何，HyDE 文本都不会进证据集合（`rag_pipeline._drop_hyde_echo`），
+    # 它只影响"拿哪句话去检索"
+    feature_hyde: bool = Field(default=True, alias="FEATURE_HYDE")
+    # HyDE 的独立预算：它自己就是一次生成调用，必须单独上闸。
+    # 不能拿 `LLM_TIMEOUT_S`（60 s）当它的上限——那等于没有上限，一次慢调用会把
+    # 整个 `TOTAL_BUDGET_MS`（8 s）吃穿，而 HyDE 只是"试试看能不能查得更准"
+    hyde_budget_ms: int = Field(default=1500, alias="HYDE_BUDGET_MS")
+    # 复合问句拆分走**本地小模型**（任务 2.4，2026-11-01）。本地端点见 `llm_local_*`：
+    # 不计费、不出网，所以它可以默认打开；关掉 = 纯规则拆分，与接模型之前逐字节一致，
+    # 这既是回滚开关，也是"模型拆分到底有没有用"的 A/B 分组
+    feature_compound_llm: bool = Field(default=True, alias="FEATURE_COMPOUND_LLM")
+    # 拆分的预算上限。它比理解层更短：这一步只是把逗号分段重新组织成问句，
+    # 0.8B 的本地模型在室温下几十毫秒就该出结果；到点就退回规则，不让它拖住首 token
+    compound_timeout_ms: int = Field(default=400, alias="COMPOUND_TIMEOUT_MS")
+    # 槽位的"模型补空"（任务 2.3）：只有章节名 / 知识点 / 任务参数这几项走大模型，
+    # 学科 / 年级 / 教材版本 / 学期**永远是规则**（§7.1.8 的安全不对称：模型抽错是
+    # "正确答案被挡在索引外"，规则抽不到只是"全库多查一轮"）。
+    # 关掉等于只保留规则抽到的槽位——这是槽位链路的回滚开关
+    feature_slot_llm: bool = Field(default=True, alias="FEATURE_SLOT_LLM")
+    # 必要槽位缺失时先追问一句再干活（教案制作缺课题、出题缺学科…见
+    # `understanding/slots.py::clarification()`）。**默认关闭**：任务 2.3 的要求是
+    # "只有影响任务执行的必要信息才触发澄清"，而"多拦一句话"的口子一旦默认开，
+    # 误拦一次用户就走了；先按关闭发布，用真实流量判断该不该开
+    feature_slot_clarify: bool = Field(default=False, alias="FEATURE_SLOT_CLARIFY")
+    # 检索策略交给大模型选（`direct` / `sub_query` / `hyde`，2026-11-01）。
+    # **只换"选哪种检索方式"这一件事**：`no_retrieval` 与 `clarify` 两条决策仍由规则判，
+    # 因为它们编码的是结构事实（这个意图根本不检索 / 指代解不开），不是偏好——
+    # 让模型去判"要不要检索"等于把"知识库里有没有"变成一次采样。
+    # 关了就是**纯规则规划**，与加这个开关之前逐字节一致：这是唯一的回滚手段，
+    # 所以模型超时 / 不给 / 给了跑不了的建议，都得能退回规则那条路径
+    feature_planner_llm: bool = Field(default=True, alias="FEATURE_PLANNER_LLM")
+    # 归一化 + 一次大模型理解（改写 + 意图）的预算上限。它和生成抢的是同一个
+    # `TOTAL_BUDGET_MS`，所以必须小于总预算（`self_check()` 会拦）
+    understanding_timeout_ms: int = Field(default=800, alias="UNDERSTANDING_TIMEOUT_MS")
+    # 中置信 FAQ 的 top3（问题 + 答案）作为**辅助上下文**进生成 prompt（§7.1.9 边界 2，
+    # 2026-10-31 修订）。它**不是证据**：不编号、不进【资料】、不进 citations，
+    # `FAQHit.answer` 在中置信档仍是 None。关掉 = 回到"中置信原文一个字都不进生成器"，
+    # 这是本改动的回滚开关（§5.3），也是一次干净的 A/B 分组
+    feature_faq_candidates: bool = Field(default=True, alias="FEATURE_FAQ_CANDIDATES")
+    # 业务权限（阶段 3）：角色 × 意图的判定在 `orchestration/admission.py::permissions_for()`，
+    # 结论（`PermissionDecision`）随 `RequestContext` 一路带到编排层，**在 FAQ 之前**生效。
+    # 置 `false` = 空拒绝集，等于整条门禁不存在——这是紧急回滚开关，与 `FEATURE_INTENT`
+    # 是同一个角色。**默认开**：权限属于"不做会出事"的那一类，不能靠别人记得打开
+    feature_permission: bool = Field(default=True, alias="FEATURE_PERMISSION")
+
+    # ---- 接入层（阶段 1，docs/EduRAG-Pro-阶段1-请求上下文与入口设计.md §3.5）----
+    # 业务硬限：`admit()` 按它拒 400 `query_too_long`。**唯一出处**——
+    # `rag_system/core/query_processor` 不再自带常量、也不再静默截断（同一次请求里
+    # 出现两种长度的问句，FAQ 精确哈希与 qcov 分母会各指向一份，排障时对不上）
+    chat_max_query_chars: int = Field(default=400, alias="CHAT_MAX_QUERY_CHARS")
+    # 请求体字节上限。它是**流量层**的粗筛（不需要解析 JSON 就能拒），
+    # 与 `chat_max_query_chars` 分工不同：后者是业务口径（中文字符数），
+    # 前者挡的是"把 200 MB 的 body 读进内存再校验"——那一步做完就已经被打了。
+    # 只按 Content-Length 判，宁可漏拦也不留半截 body 在内存里。
+    max_request_bytes: int = Field(default=65536, alias="MAX_REQUEST_BYTES")
+    # JWT（HS256）验签密钥。**空 = 不启用 JWT**：此时只有白名单环境才认 `X-User-Id`
+    # 一类的开发期请求头，生产环境一律匿名。空值**不是**"随便签一个"的邀请，
+    # 生产漏配的表现是"所有请求都成了 ANONYMOUS"，而不是"所有人都能冒充"
+    jwt_secret: str = Field(default="", alias="JWT_SECRET")
+    # 签发时用的过期时长。**认证服务自己不用它**（改用下面 `AUTH_*_TTL_S`，
+    # 单位是秒、access 与 refresh 分开），保留是因为 tools/网关注入的令牌仍按它算。
+    jwt_expire_min: int = Field(default=120, alias="JWT_EXPIRE_MIN")
+    # 验签的时钟漂移容差。`exp` / `nbf` / `iat` 三个时间断言都按它放宽：
+    # 多机部署里各节点时钟差几十秒是常态，而"过了 3 秒就 401"会表现为
+    # 随机一批用户间歇性掉登录，最难复现的那种故障。放宽的代价是过期令牌
+    # 多活 60 秒，远小于它带来的稳定性收益。
+    jwt_leeway_s: int = Field(default=60, alias="JWT_LEEWAY_S")
+    # ---- 认证接口（`auth/`，用户 2026-10-31 定案）----
+    # access token 寿命。**600 秒替换掉接口文档示例里的 3600**：登出只作废 refresh
+    # （JWT 无状态，access 不落库，见 `auth/store.py` 模块注释），
+    # 所以"登出后多久真正失效"完全由这个数字决定。调大 = 延长"已登出但仍可用"的窗口，
+    # 调小 = 前端刷新更频繁。10 分钟是两者之间用户拍板的口径。
+    auth_access_ttl_s: int = Field(default=600, alias="AUTH_ACCESS_TTL_S")
+    # refresh 寿命：默认 7 天；勾选「记住我」时 30 天
+    auth_refresh_ttl_s: int = Field(default=604800, alias="AUTH_REFRESH_TTL_S")
+    auth_refresh_ttl_remember_s: int = Field(default=2592000, alias="AUTH_REFRESH_TTL_REMEMBER_S")
+
+    # ---- 会话与记忆（CLAUDE.md §7.9，对标 §7.3 的裁剪版）----
+    # 会话 L0 窗口双上限：40 轮或 28 000 token，先到先压（§3.7 第 2 条）
+    mem_window_turns: int = Field(default=40, alias="MEM_WINDOW_TURNS")
+    mem_window_tokens: int = Field(default=28000, alias="MEM_WINDOW_TOKENS")
+    # 每次压缩吃掉最旧的 10 轮，滚动进摘要
+    mem_compress_batch_turns: int = Field(default=10, alias="MEM_COMPRESS_BATCH_TURNS")
+    mem_summary_max_tokens: int = Field(default=400, alias="MEM_SUMMARY_MAX_TOKENS")
+    # 原子记忆：召回条数、置信度门槛、合并阈值、单用户活跃上限
+    mem_recall_top_k: int = Field(default=5, alias="MEM_RECALL_TOP_K")
+    mem_min_confidence: float = Field(default=0.6, alias="MEM_MIN_CONFIDENCE")
+    mem_dedupe_sim: float = Field(default=0.92, alias="MEM_DEDUPE_SIM")
+    mem_atom_limit_per_user: int = Field(default=500, alias="MEM_ATOM_LIMIT_PER_USER")
+    # 记忆段注入 prompt 的 token 预算：画像 300 / 摘要 400 / 原子 300（§3.7 第 3 条）
+    mem_profile_max_tokens: int = Field(default=300, alias="MEM_PROFILE_MAX_TOKENS")
+    mem_atom_max_tokens: int = Field(default=300, alias="MEM_ATOM_MAX_TOKENS")
+    # 记忆召回超时（§3.7 第 8 条）：到点就返回空记忆 + degraded，主链路继续跑检索
+    mem_recall_budget_ms: int = Field(default=120, alias="MEM_RECALL_BUDGET_MS")
+    # 会话数据在 Redis 里的留存时间；Redis 不可用时退化为进程内（重启即丢）
+    mem_session_ttl_s: int = Field(default=86400, alias="MEM_SESSION_TTL_S")
+    # 物理清理窗口（§3.7 第 5 条：软删 30 天后物理清理）。`scripts/purge_memory.py` 用它，
+    # 且**只由它一个旋钮**决定三张表（memory_atom / chat_message / session_summary）的窗口：
+    # 拆成三个变量后，"到底哪一个是留存策略"就没人说得清了。要分开必须连文档一起改。
+    mem_purge_after_days: int = Field(default=30, alias="MEM_PURGE_AFTER_DAYS")
+    # 单条 DELETE 的行数上限。分批删是为了不长时间持锁：一次删十万行会把写入全卡住
+    mem_purge_batch: int = Field(default=2000, alias="MEM_PURGE_BATCH")
+    # 总开关：关掉等于"无会话、无记忆"的老行为，用于灰度与排障
+    feature_memory: bool = Field(default=True, alias="FEATURE_MEMORY")
+    # L2 原子记忆的向量召回（§3.7 第 8 条）。关掉 / RAG 未就绪时退回字面 bigram 排序，
+    # 这是**功能降级不是故障**：召回顺序变差，回答照常。
+    feature_memory_vector: bool = Field(default=True, alias="FEATURE_MEMORY_VECTOR")
+
     # ---- 向量库 Milvus（CLAUDE.md §8.1）----
-    milvus_uri: str = Field(default="http://127.0.0.1:19531", alias="MILVUS_URI")
+    milvus_uri: str = Field(default="http://127.0.0.1:19541", alias="MILVUS_URI")
     milvus_database: str = Field(default="edurag", alias="MILVUS_DATABASE")
     milvus_collection: str = Field(default="edurag_chunk", alias="MILVUS_COLLECTION")
+    # 原子记忆的向量集合（§3.7 第 8 条）。**与知识库集合分开**：一个是可重建的索引，
+    # 一个是用户数据（重建知识库时不该把记忆一起 drop 掉），且两边的过滤条件完全不同。
+    milvus_memory_collection: str = Field(
+        default="edurag_memory", alias="MILVUS_MEMORY_COLLECTION"
+    )
     milvus_token: str = Field(default="", alias="MILVUS_TOKEN")
     # BGE-M3 输出 1024 维；改模型必须同步改这里，否则 upsert 直接报维度不匹配
     milvus_dim: int = Field(default=1024, alias="MILVUS_DIM")
@@ -152,7 +366,7 @@ class Settings(BaseSettings):
     # auto：有 FlagEmbedding+模型就用真模型，否则用确定性哈希向量（只给测试/离线跑通用）
     rag_embed_backend: str = Field(default="auto", alias="RAG_EMBED_BACKEND")
     rag_embed_model_path: str = Field(
-        default="../Ragpro/rag_system/models/BAAI/bge-m3", alias="RAG_EMBED_MODEL_PATH"
+        default="rag_system/models/BAAI/bge-m3", alias="RAG_EMBED_MODEL_PATH"
     )
     # cuda / cpu / auto
     rag_embed_device: str = Field(default="auto", alias="RAG_EMBED_DEVICE")
@@ -166,6 +380,9 @@ class Settings(BaseSettings):
     mineru_model: str = Field(default="vlm", alias="MINERU_MODEL")
     mineru_poll_interval: int = Field(default=5, alias="MINERU_POLL_INTERVAL")
     mineru_timeout_s: int = Field(default=900, alias="MINERU_TIMEOUT_S")
+    # 上传超时单独一根：与轮询超时共用一个数会让 60 MB 的教材在慢上行链路上必然写超时
+    # （2026-10-29 实测 `WriteTimeout: The write operation timed out` → 退本地 PyMuPDF）
+    mineru_upload_timeout_s: int = Field(default=900, alias="MINERU_UPLOAD_TIMEOUT_S")
     # 解析结果缓存目录：同一份 PDF 只花一次额度（相对仓库根目录）
     mineru_cache_dir: str = Field(default="data/mineru", alias="MINERU_CACHE_DIR")
 
@@ -196,6 +413,16 @@ class Settings(BaseSettings):
         return p if p.is_absolute() else (BASE_DIR / p).resolve()
 
     @property
+    def reranker_model_path(self) -> Path:
+        """与 `embed_model_path` 同一口径：相对路径一律按仓库根解析。
+
+        不能直接 `Path(settings.rag_reranker_path)`——PyCharm 直接 run、计划任务、
+        `python scripts/xxx.py` 三种启动方式的工作目录各不相同，相对路径会各指一处。
+        """
+        p = Path(self.rag_reranker_path).expanduser()
+        return p if p.is_absolute() else (BASE_DIR / p).resolve()
+
+    @property
     def mineru_cache_path(self) -> Path:
         return (BASE_DIR / self.mineru_cache_dir).resolve()
 
@@ -217,6 +444,30 @@ class Settings(BaseSettings):
     @property
     def intent_labels(self) -> tuple[str, ...]:
         return INTENT_LABELS
+
+    @property
+    def llm_enabled(self) -> bool:
+        """有 key 才允许调生成；没有 key 时 chat 走兜底，FAQ / RAG 不受影响。"""
+        return bool(self.llm_api_key.strip())
+
+    @property
+    def llm_endpoint(self) -> str:
+        """OpenAI 兼容的补全地址。base_url 允许带或不带结尾斜杠。"""
+        return self.llm_base_url.rstrip("/") + "/chat/completions"
+
+    @property
+    def llm_local_endpoint(self) -> str:
+        """本地端点的补全地址（Ollama 的 OpenAI 兼容层 `/v1`）。"""
+        return self.llm_local_base_url.rstrip("/") + "/chat/completions"
+
+    @property
+    def llm_local_enabled(self) -> bool:
+        """本地端点是否配置齐全。
+
+        **刻意不看 `LLM_API_KEY`**：本地 Ollama 不需要 key，把云端 key 当开关会让
+        "没配云 key 的开发机"连闲聊都走不了本地——而这恰恰是最需要它的场景。
+        """
+        return bool(self.llm_local_base_url.strip() and self.llm_local_model.strip())
 
     @property
     def subjects(self) -> tuple[str, ...]:
@@ -243,12 +494,136 @@ class Settings(BaseSettings):
             problems.append("FAQ_MIN_CANDIDATES 必须 ≥1")
         if self.faq_top_k <= 0:
             problems.append("FAQ_TOP_K 必须为正")
+        if self.llm_timeout_s <= 0:
+            problems.append("LLM_TIMEOUT_S 必须为正")
+        if self.llm_local_timeout_s <= 0:
+            problems.append("LLM_LOCAL_TIMEOUT_S 必须为正")
+        if self.llm_max_tokens <= 0:
+            problems.append("LLM_MAX_TOKENS 必须为正")
+        if not 0 <= self.llm_temperature <= 2:
+            problems.append(f"LLM_TEMPERATURE={self.llm_temperature} 必须在 [0,2] 之间")
+        # 上界是"别把一次超时放大成一串超时"：3 次以上重试一定吃掉整个生成预算
+        if not 0 <= self.llm_max_retries <= 3:
+            problems.append(f"LLM_MAX_RETRIES={self.llm_max_retries} 必须在 [0,3] 之间")
+        if self.total_budget_ms <= 0:
+            problems.append("TOTAL_BUDGET_MS 必须为正")
+        if not 0 <= self.citation_min_support <= 1:
+            problems.append("CITATION_MIN_SUPPORT 必须在 [0,1] 之间")
+        # 理解层预算必须**严格小于**总预算：相等时生成只剩 0 ms，等于每条请求都截断
+        if not 0 < self.understanding_timeout_ms < self.total_budget_ms:
+            problems.append(
+                f"UNDERSTANDING_TIMEOUT_MS={self.understanding_timeout_ms} 必须在 (0, {self.total_budget_ms}) 之间"
+            )
+        # HyDE 与拆句各自又是**两笔**独立开销，与理解层一起压在首 token 预算上。
+        # 这里只保证单项没写反（0 或负数等于"每次都超时"，比总预算还大等于没有闸门）；
+        # 三者之和的提醒放在 `soft_warnings()`，因为叠加超支是性能问题，不是配置错误
+        if not 0 < self.hyde_budget_ms < self.total_budget_ms:
+            problems.append(
+                f"HYDE_BUDGET_MS={self.hyde_budget_ms} 必须在 (0, {self.total_budget_ms}) 之间"
+            )
+        if not 0 < self.compound_timeout_ms < self.total_budget_ms:
+            problems.append(
+                f"COMPOUND_TIMEOUT_MS={self.compound_timeout_ms} 必须在 (0, {self.total_budget_ms}) 之间"
+            )
+        # 下界 100：比短问句还短的业务上限等于"几乎全拒"，那不是配置是事故；
+        # 上界 4000：再长的问句 embedding 与 BM25 都不划算，且传输层已另有 64 KB 硬上限
+        if not 100 <= self.chat_max_query_chars <= 4000:
+            problems.append(
+                f"CHAT_MAX_QUERY_CHARS={self.chat_max_query_chars} 必须在 [100, 4000] 之间"
+            )
+        # 下界 1024：比任何合法请求体都小的话，正常问句会被 413 拦在门外；
+        # 上界 1 MiB：再往上不是问答请求，是上传
+        if not 1024 <= self.max_request_bytes <= 1024 * 1024:
+            problems.append(f"MAX_REQUEST_BYTES={self.max_request_bytes} 必须在 [1024, 1048576] 之间")
+        # 容差超过一分钟就不再是"漂移补偿"：过期令牌能多活的时间与配置名对不上
+        if not 0 <= self.jwt_leeway_s <= 300:
+            problems.append(f"JWT_LEEWAY_S={self.jwt_leeway_s} 必须在 [0, 300] 之间")
+        # access 必须短于 refresh：反过来的话"用 refresh 换新 access"这件事
+        # 每次换出来的有效期比原令牌还长，轮换就变成无限续命。上限 24 小时是
+        # 防止"登出后 access 仍可用一整天"——那与 `auth/store.py` 的取舍前提相反
+        if not 0 < self.auth_access_ttl_s <= 86400:
+            problems.append(f"AUTH_ACCESS_TTL_S={self.auth_access_ttl_s} 必须在 (0, 86400] 之间")
+        if self.auth_refresh_ttl_s < self.auth_access_ttl_s:
+            problems.append(
+                f"AUTH_REFRESH_TTL_S={self.auth_refresh_ttl_s} 不能小于 AUTH_ACCESS_TTL_S={self.auth_access_ttl_s}"
+            )
+        # 「记住我」只许放宽，不许收紧：比默认还短等于勾了反而更快掉线
+        if self.auth_refresh_ttl_remember_s < self.auth_refresh_ttl_s:
+            problems.append(
+                f"AUTH_REFRESH_TTL_REMEMBER_S={self.auth_refresh_ttl_remember_s} 不能小于 AUTH_REFRESH_TTL_S={self.auth_refresh_ttl_s}"
+            )
         return problems
+
+    def soft_warnings(self) -> list[str]:
+        """**不阻断启动**的配置提醒（与 `self_check()` 分开）。
+
+        `self_check()` 的返回值在 `ALLOW_DEGRADED_START=false` 下会让进程退出，
+        所以"开发机没配 key"这种可以降级跑的情况不能放进去——放进去就等于
+        一台没有 key 的机器连 FAQ 都起不来（§2.5 已针对 LLM 做过同样的修正）。
+        """
+        warnings: list[str] = []
+        if (self.feature_query_rewrite or self.feature_intent_llm) and not self.llm_api_key.strip():
+            warnings.append(
+                "FEATURE_QUERY_REWRITE/FEATURE_INTENT_LLM 已开启但 LLM_API_KEY 为空："
+                "改写与 LLM 意图均降级为「只用归一化 + 规则分类」"
+            )
+        if self.feature_query_rewrite and self.understanding_timeout_ms >= self.total_budget_ms // 2:
+            warnings.append(
+                f"UNDERSTANDING_TIMEOUT_MS={self.understanding_timeout_ms} 已占超过总预算的一半，"
+                "首 token 延迟会被改写挤压（§6.1）"
+            )
+        # 理解 + 拆句 + HyDE 三段都在首 token 之前，各自都有闸门，但**加起来**仍可能
+        # 吃掉半个总预算。这不是配置错误（每一项单看都合法），是必须被看见的性能账：
+        # 全线超时时用户等的是 1.2 s 首 token 变成 4 s
+        pre_answer_ms = (
+            self.understanding_timeout_ms + self.compound_timeout_ms
+            + (self.hyde_budget_ms if self.feature_hyde else 0)
+        )
+        if pre_answer_ms >= self.total_budget_ms // 2:
+            warnings.append(
+                f"理解/拆句/HyDE 预算合计 {pre_answer_ms} ms 已超过总预算的一半"
+                f"（TOTAL_BUDGET_MS={self.total_budget_ms}）：首 token SLO 可能不达标（§6.1）"
+            )
+        if self.feature_hyde and not self.llm_api_key.strip():
+            warnings.append(
+                "FEATURE_HYDE 已开启但 LLM_API_KEY 为空：HyDE 生成不出来，"
+                "planner 会如实降级为 DIRECT + hyde_unavailable"
+            )
+        # 生产没配 JWT_SECRET 不阻断（匿名问答是合法降级），但必须大声说出来：
+        # 此时 `X-User-Id` 一律不认，所有请求都是 ANONYMOUS——记不住会话、也不挂记忆
+        if not self.jwt_secret.strip() and not is_trusted_env(self):
+            warnings.append(
+                f"APP_ENV={self.app_env} 下 JWT_SECRET 为空：所有请求将按 ANONYMOUS 处理"
+                "（不认任何请求头身份，会话与记忆都不会落库）"
+            )
+        return warnings
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+# ---- 环境可信度（唯一出处）-------------------------------------------------
+# 只有这几个环境才信任客户端自报的身份 / 租户头：都是"本地或测试"。
+# **staging 不在白名单里**——预发环境连的常常是生产数据，把它算成"安全"等于让一个
+# 改请求头的人读到别人的知识库或别人的记忆，而这正是预发最容易被忽略的地方。
+#
+# 为什么放在 `base/` 而不是各业务包里：`orchestration/api.py`（租户/ACL 头）与
+# `memory/api.py`（记忆身份头）都要用同一条规则，而 `memory/` 不许 import
+# `orchestration/`（§7.0 硬边界 1）。同一份白名单写两遍，下一次改它必然只改一处，
+# 于是两处行为在某个环境上悄悄分叉——安全开关分叉比没有开关更糟。
+TRUSTED_ENVS = frozenset({"dev", "development", "local", "test", "testing"})
+
+
+def is_trusted_env(settings: object) -> bool:
+    """该环境是否信任客户端自报的身份头。**白名单**：没见过的 `APP_ENV` 一律不可信。
+
+    用白名单而不是 `env != "prod"`：将来多出一个没见过的取值时，白名单让它落到
+    "不信任"（安全的那一侧），黑名单让它落到"信任"（危险的那一侧）。
+    """
+    env = str(getattr(settings, "app_env", "dev") or "dev").strip().lower()
+    return env in TRUSTED_ENVS
 
 
 @lru_cache(maxsize=1)

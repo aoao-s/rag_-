@@ -5,6 +5,7 @@
     python -m rag_system.ingest                        # 用 RAG_DOCS_DIR 配置的目录
     python -m rag_system.ingest --paths datasets/01_textbook --pdf datasets/09_textbooks/x.pdf
     python -m rag_system.ingest --recreate --dry-run   # 只切分不入库，看块数与耗时
+    python -m rag_system.ingest --exclude 题库.json     # 分两趟：先教材/教案/试卷，题库单独一趟
 
 幂等策略：每个文件入库前按 `source` 删旧块。这样"改了一篇教案再跑一次"不会留下
 两份互相矛盾的旧块，也不需要在 Milvus 里维护版本表。
@@ -17,11 +18,13 @@ import json
 import sys
 import time
 from dataclasses import dataclass, field
+from fnmatch import fnmatch
 from pathlib import Path
 
 from base.config import BASE_DIR, Settings, get_settings
 from base.logger import configure, get_logger
 from rag_system.document_loaders.base import LoadedDoc
+from rag_system.document_loaders.dedup import DedupIndex
 from rag_system.document_loaders.thy_factory import DocumentLoaderFactory
 from rag_system.embedding.bge_m3 import build_embedder
 from rag_system.store.milvus_store import ChunkStore
@@ -29,11 +32,14 @@ from rag_system.text_splitters.parent_child import ParentChildSplitter, Splitter
 
 log = get_logger(__name__)
 
+# 文档指纹在磁盘上的位置：跨批次共用，增量入库也能拦住上一批里已经进过的那份
+FINGERPRINT_PATH = BASE_DIR / "data" / "doc_fingerprints.json"
+
 
 @dataclass(slots=True)
 class FileResult:
     path: str
-    status: str  # ok / failed / skipped
+    status: str  # ok / failed / skipped / duplicate
     chunks: int = 0
     chars: int = 0
     cost_ms: int = 0
@@ -45,6 +51,7 @@ class IngestReport:
     files: int = 0
     docs_ok: int = 0
     docs_failed: int = 0
+    duplicates: int = 0
     chunks: int = 0
     written: int = 0
     deleted: int = 0
@@ -56,11 +63,16 @@ class IngestReport:
             "files": self.files,
             "docs_ok": self.docs_ok,
             "docs_failed": self.docs_failed,
+            # 近重复被拒的条数与明细：静默跳过等于"库里少了两本书"却没人知道
+            "duplicates": self.duplicates,
             "chunks": self.chunks,
             "written": self.written,
             "deleted": self.deleted,
             "elapsed_ms": self.elapsed_ms,
             "failures": [{"path": r.path, "error": r.error} for r in self.results if r.status == "failed"],
+            "skipped_duplicates": [
+                {"path": r.path, "reason": r.error} for r in self.results if r.status == "duplicate"
+            ],
         }
 
 
@@ -72,6 +84,8 @@ class IngestPipeline:
         store: ChunkStore | None = None,
         embedder=None,
         factory: DocumentLoaderFactory | None = None,
+        dedup: DedupIndex | None = None,
+        fingerprint_path: Path | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         s = self.settings
@@ -86,6 +100,8 @@ class IngestPipeline:
         self._store = store
         self._embedder = embedder
         self._factory = factory or DocumentLoaderFactory.build(s)
+        self._dedup = dedup
+        self.fingerprint_path = fingerprint_path or FINGERPRINT_PATH
 
     # 惰性创建：dry-run 不连 Milvus，也不加载 2GB 模型
     @property
@@ -100,6 +116,23 @@ class IngestPipeline:
             self._embedder = build_embedder(self.settings)
         return self._embedder
 
+    @property
+    def dedup(self) -> DedupIndex:
+        """查重表：首次访问时按配置建好并灌入历史指纹。
+
+        历史指纹很重要——增量入库一次只跑几个文件，不读盘就拦不住上一批已经进过的那份。
+        指纹文件损坏时 `load()` 返回 0（当空表），宁可漏拦也不能让入库整体失败。
+        """
+        if self._dedup is None:
+            s = self.settings
+            self._dedup = DedupIndex(
+                enabled=s.rag_dedup_enabled,
+                distance=s.rag_dedup_distance,
+                prefix_chars=s.rag_dedup_prefix_chars,
+            )
+            self._dedup.load(self.fingerprint_path)
+        return self._dedup
+
     def run(
         self,
         targets: list[Path],
@@ -107,6 +140,8 @@ class IngestPipeline:
         recreate: bool = False,
         dry_run: bool = False,
         limit: int | None = None,
+        allow_duplicate: bool = False,
+        exclude: tuple[str, ...] = (),
     ) -> IngestReport:
         started = time.perf_counter()
         report = IngestReport()
@@ -116,21 +151,52 @@ class IngestPipeline:
         for path, item in self._factory.iter_documents(targets):
             if limit is not None and report.files >= limit:
                 break
+            # 按文件名排除：分两趟入库时用（题库体积占七成，先让教材/教案/试卷可用）
+            if exclude and any(fnmatch(Path(path).name, pat) for pat in exclude):
+                continue
             report.files += 1
             if isinstance(item, Exception):
                 report.docs_failed += 1
                 report.results.append(FileResult(str(path), "failed", error=f"{type(item).__name__}: {item}"))
                 log.warning("ingest_file_failed", path=str(path), error=str(item))
                 continue
-            report.results.append(self._ingest_one(item, report, dry_run=dry_run))
+            report.results.append(self._ingest_one(item, report, dry_run=dry_run, allow_duplicate=allow_duplicate))
 
         report.elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if not dry_run and self.settings.rag_dedup_enabled:
+            try:
+                saved = self.dedup.save(self.fingerprint_path)
+                log.info("ingest_fingerprints_saved", count=len(self.dedup), path=str(saved))
+            except OSError as exc:  # 指纹存不下不影响本次入库，只是下次拦不住
+                log.warning("ingest_file_failed", path=str(self.fingerprint_path), error=f"指纹保存失败: {exc}")
         log.info("ingest_done", **report.summary())
         return report
 
-    def _ingest_one(self, doc: LoadedDoc, report: IngestReport, *, dry_run: bool) -> FileResult:
+    def _ingest_one(
+        self,
+        doc: LoadedDoc,
+        report: IngestReport,
+        *,
+        dry_run: bool,
+        allow_duplicate: bool = False,
+    ) -> FileResult:
         t0 = time.perf_counter()
         try:
+            # 查重放在切分之前：被拒的文档不该付切分与向量化的代价
+            if not allow_duplicate:
+                duplicate = self.dedup.check_and_add(doc.source, doc.text)
+                if duplicate is not None:
+                    report.duplicates += 1
+                    reason = f"doc_duplicate: 与 {duplicate.kept_source} 近重复（{duplicate.reason}）"
+                    log.warning(
+                        "ingest_duplicate",
+                        path=doc.source,
+                        kept_source=duplicate.kept_source,
+                        reason=duplicate.reason,
+                        distance=duplicate.distance,
+                    )
+                    return FileResult(doc.source, "duplicate", chars=len(doc.text), error=reason)
+
             chunks = self.splitter.split(doc)
             if len(chunks) > self.settings.rag_max_chunks_per_doc:
                 chunks = chunks[: self.settings.rag_max_chunks_per_doc]
@@ -158,6 +224,8 @@ class IngestPipeline:
                 subject=doc.subject,
                 doc_type=doc.doc_type,
                 title=doc.title,
+                stage=doc.stage,
+                grade=doc.grade,
                 embedder=self.embedder.name,
             )
             report.docs_ok += 1
@@ -196,6 +264,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="只切分不向量化、不入库")
     p.add_argument("--limit", type=int, default=None, help="只处理前 N 个文件（试探用）")
     p.add_argument("--defaults", action="store_true", help=f"使用 RAG_DOCS_DIR（{s.rag_docs_dir}）")
+    p.add_argument(
+        "--allow-duplicate",
+        action="store_true",
+        help="关闭近重复检测（对照实验用；正常入库不要开）",
+    )
+    p.add_argument(
+        "--exclude",
+        nargs="*",
+        default=[],
+        help="按文件名 glob 跳过（如 --exclude 题库.json），分两趟入库时用",
+    )
     return p.parse_args(argv)
 
 
@@ -215,17 +294,27 @@ def main(argv: list[str] | None = None) -> int:
     targets = [t if t.is_absolute() else (BASE_DIR / t) for t in targets]
 
     pipeline = IngestPipeline(settings)
-    report = pipeline.run(targets, recreate=args.recreate, dry_run=args.dry_run, limit=args.limit)
+    report = pipeline.run(
+        targets,
+        recreate=args.recreate,
+        dry_run=args.dry_run,
+        limit=args.limit,
+        allow_duplicate=args.allow_duplicate,
+        exclude=tuple(args.exclude),
+    )
     manifest = pipeline.write_manifest(report)
 
     print("\n==== 入库结果 ====")
-    print(f"文件 {report.files}（成功 {report.docs_ok} / 失败 {report.docs_failed}）")
+    print(f"文件 {report.files}（成功 {report.docs_ok} / 失败 {report.docs_failed} / 近重复跳过 {report.duplicates}）")
     print(f"子块 {report.chunks}，写入 {report.written}，删除旧块 {report.deleted}")
     print(f"耗时 {report.elapsed_ms} ms" + ("（dry-run，未写库）" if args.dry_run else ""))
     print(f"清单 {manifest}")
     for r in report.results:
         if r.status == "failed":
             print(f"  [FAIL] {Path(r.path).name}: {r.error}")
+        elif r.status == "duplicate":
+            # 近重复要显式打出来：它是"数据没问题但库少了一本书"的唯一现场
+            print(f"  [DUP ] {Path(r.path).name}: {r.error}")
     return 0 if report.docs_failed == 0 else 1
 
 

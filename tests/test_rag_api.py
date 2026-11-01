@@ -10,8 +10,10 @@ import asyncio
 import httpx
 from fastapi import FastAPI
 
+from base.config import Settings
 from rag_system.api import router as rag_router
 from rag_system.core.evidence_gate import evaluate as gate_evaluate
+from rag_system.core.rag_pipeline import RagPipeline
 from rag_system.core.retriever import Evidence, RetrievalResult
 
 
@@ -57,8 +59,13 @@ def _ev(parent_id: str, score: float, subject: str = "数学") -> Evidence:
     )
 
 
+def _settings() -> Settings:
+    return Settings(rag_evidence_threshold=0.35, rag_evidence_margin=0.03, rag_evidence_qcov=0.0)
+
+
 def _make_app(evidences: list[Evidence], ready: bool = True) -> FastAPI:
     retriever = _FakeRetriever(evidences)
+    settings = _settings()
     app = FastAPI()
     app.include_router(rag_router)
     app.state.rag = (
@@ -66,6 +73,8 @@ def _make_app(evidences: list[Evidence], ready: bool = True) -> FastAPI:
             "ready": True,
             "reason": "ok",
             "retriever": retriever,
+            # 与线上同一条管线：接口是调试台，绕开 pipeline 展示的就不是线上行为
+            "pipeline": RagPipeline(settings, retriever, max_repairs=0),
             # 假门的重点在"接口把门的结论透出去"；问题词覆盖度由 test_rag_retriever 单独验证
             "gate": lambda r: gate_evaluate(r, threshold=0.35, margin=0.03, min_qcov=0.0),
             "embedder_name": "fake",

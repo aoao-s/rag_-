@@ -227,6 +227,8 @@ class FAQService:
         log_query: bool = False,
         cross_subject_delta: float = 0.05,
         dedupe_near_dup: bool = True,
+        tenant_id: str = "",
+        tenant: str | None = None,
     ) -> None:
         self._repo = repository
         self._policy = policy or MatchPolicy()
@@ -239,6 +241,12 @@ class FAQService:
         self._cache_prefix = cache_prefix
         self._cross_subject_delta = cross_subject_delta
         self._dedupe_near_dup = dedupe_near_dup
+        # 租户维度进缓存键（阶段 1 验收 5）。**必须是构造期属性而不是 `search()` 的参数**：
+        # 租户是"这个进程代表谁在查"的部署事实，由接入层决定（CLAUDE.md §7.7 硬规则 4），
+        # 一次请求没法把它改掉。`tenant` 是 `tenant_id` 的别名，两个名字都收，
+        # 是因为历史调用点已经在用 `tenant_id`，而契约文档写的是 `tenant`；
+        # 同时给时以 `tenant_id` 为准（正式名优先，不让别名覆盖它）。
+        self._tenant_id = (tenant_id or tenant or "").strip()
         self._single_flight = SingleFlight()
         # 原始 query 可能含学生隐私（姓名/手机号），默认只记长度与指纹
         self._log_query = log_query
@@ -396,12 +404,16 @@ class FAQService:
             else:
                 # 中/低置信：都**不返回答案**，只回候选；mid 多一个可确认的 top1。
                 # 按 entry.tier 复原而不重新判定——同一 query 不能因为 margin 抖动在两档间反复跳。
+                # 候选**带答案**：中置信档要把它当辅助上下文塞进生成 prompt（§7.1.9 修订）。
+                # 缓存里只存 (faq_id, score)，答案从快照现取——省一次缓存结构迁移，
+                # 且快照与语料版本同生共死，不会出现"缓存里的答案比语料旧"。
                 self._stats.cache_hits += 1
                 cached_candidates = tuple(
                     FAQCandidate(
                         faq_id=fid,
                         question=snapshot.records[fid].question,
                         score=score,
+                        answer=snapshot.records[fid].answer,
                     )
                     for fid, score in cached.candidates
                     if fid in snapshot.records
@@ -525,12 +537,14 @@ class FAQService:
 
         top_subject = snapshot.records[result.faq_id].subject if result.faq_id in snapshot.records else None
 
-        # 未命中也要给 RAG 留 top3 扩展线索；mid 档还要靠 top1 做"你是不是想问"的追问对象
+        # 未命中也要给 RAG 留 top3 扩展线索；mid 档还要靠 top1 做"你是不是想问"的追问对象。
+        # 候选一并带答案：只有 mid 档会把它当辅助上下文用（§7.1.9 修订），low 档照样丢弃。
         candidates = tuple(
             FAQCandidate(
                 faq_id=fid,
                 question=snapshot.records[fid].question,
                 score=round(raw / (raw + self._policy.norm_k), 4),
+                answer=snapshot.records[fid].answer,
             )
             for fid, raw in ranked[: self._policy.candidate_n]
             if fid in snapshot.records
@@ -568,6 +582,8 @@ class FAQService:
 
         if result.tier == "mid":
             # 中置信：跑 RAG + 候选，**不返回答案**（§7.1.9 边界 2）。
+            # 候选的问答对会进生成 prompt 当辅助上下文，但 `answer` 字段仍是 None，
+            # 也不作为证据参与引用对齐——"能参考"不等于"能交付"（2026-10-31 修订）。
             # 缓存与负缓存同寿（30 s）：mid 是"待确认"的临时结论，不该活 1 小时。
             self._stats.candidates_served += len(candidates)
             await self._cache_fill(
@@ -737,15 +753,22 @@ class FAQService:
         return self._stats.as_dict()
 
     # ------------------------------------------------------------------ 内部
-    def _cache_key(self, version: int, norm: str, scope: str) -> str:
-        """key = faq:v{语料版本}:{检索范围}:{归一化问法指纹}。
+    def _cache_key(self, version: int, norm: str, scope: str, tenant: str = "") -> str:
+        """key = faq:{租户}:v{语料版本}:{检索范围}:{归一化问法指纹}。
 
         用指纹而不是原文：key 长度稳定、不把学生问法写进 Redis 键空间。
         带版本号是刻意的——发布/下线只需让路由到新版本，旧键靠 TTL 自然淘汰。
         带检索范围是必须的——`数学` 与 `*` 是两次不同的检索，共用一个 key 会串答案。
+        带租户同理，而且更要命：`faq` 表今天没有租户列，两个租户的**同一句话**
+        恰好能被同一份收录答掉时，共用一条缓存就等于把 A 校的答案发给 B 校；
+        等表加上 `tenant_id`，这就从"侥幸没泄漏"变成"确定泄漏"。
+
+        `tenant` 参数留空时回落到构造期注入的 `self._tenant_id`——调用侧不必
+        每次都记得传，忘了传的后果不该是"静默跨租户共享"。
         """
         digest = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:20]
-        return f"{self._cache_prefix}:faq:v{version}:{scope}:{digest}"
+        who = (tenant or self._tenant_id or "").strip() or "-"
+        return f"{self._cache_prefix}:faq:t{who}:v{version}:{scope}:{digest}"
 
     async def _cache_lookup(self, key: str) -> tuple[CacheEntry | None, str]:
         if self._cache is None:
@@ -988,8 +1011,11 @@ class FAQService:
             return FAQHit(
                 tier=tier,
                 faq_id=record.faq_id,
-                # 中置信**不返回答案**：只给候选问题让用户确认，正文必须走 RAG 或确认通道。
-                # 把 FAQ 原文漏给生成器，模型会照抄，一条错答案立刻变成"带引用的事实"（§7.1.9）。
+                # 中置信**不返回答案**：正文必须走 RAG 或确认通道，这一条没有变。
+                # 2026-10-31 修订的是**另一件事**：`candidates` 里的问答对可以进生成 prompt
+                # 当辅助上下文（编排层 `_faq_prompt_candidates()`，非证据、不编号、不进引用）。
+                # `answer` 这个字段在中置信档恒为 None——"参考"和"当作答案交付"是两回事，
+                # 合并它等于让一条没验过的 BM25 匹配直接变成带引用的结论。
                 answer=record.answer if tier == "high" else None,
                 score=score,
                 subject=record.subject,

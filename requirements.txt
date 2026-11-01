@@ -21,6 +21,10 @@ redis==8.1.0
 # ---- 中文处理 ----
 jieba==0.42.1
 
+# ---- 账号口令（auth/passwords.py）----
+# 导入名是 `argon2`，分发名是 `argon2-cffi`（两者不同，装的时候用后者）
+argon2-cffi==25.1.0
+
 # ---- 测试 ----
 pytest==9.1.1
 httpx==0.28.1

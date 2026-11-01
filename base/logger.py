@@ -257,7 +257,10 @@ class _StdlibAdapter:
 
 
 def get_logger(name: str) -> Any:
-    configure()
+    # 只在首次初始化时配：`configure()` 每次调用都会按传入级别重设 handler，
+    # 而这里的默认参数是 INFO——无条件调用会把 lifespan / 脚本设好的级别悄悄改回去。
+    if not _configured:
+        configure()
     if _HAS_STRUCTLOG:
         # 统一前缀，日志里直接能看出这是本项目的 logger
         return structlog.get_logger(f"{LOG_PREFIX}.{name}")

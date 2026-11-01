@@ -46,7 +46,9 @@ class BgeReranker:
 
 
 def build_reranker(settings) -> BgeReranker:
-    model_path = Path(settings.rag_reranker_path)
+    # 走 Settings 的 `reranker_model_path`：相对路径按仓库根解析，换工作目录不会静默找不到
+    model_path = getattr(settings, "reranker_model_path", None) or Path(settings.rag_reranker_path)
+    model_path = Path(model_path)
     if not model_path.exists():
         raise FileNotFoundError(f"重排模型不存在：{model_path}（设置 RAG_RERANKER_PATH 指向 bge-reranker-v2-m3）")
     return BgeReranker(

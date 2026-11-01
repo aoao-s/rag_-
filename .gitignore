@@ -25,6 +25,12 @@ docker/offline/images/
 # IDE
 .idea/
 
+# Office 临时/锁文件（Excel 打开时生成 ~$xxx.xlsx，不是内容）
+~$*
+
 
 # 模型权重（体积大，放本地或挂载盘，不入库）
 rag_system/models/
+
+# 阶段验收脚本（本地按阶段手动跑，不入库；单测与契约测试仍在 tests/）
+stage_tests/

@@ -216,3 +216,306 @@ class TestImageLoader:
             return
         doc = ImageLoader().load(path)
         assert doc.doc_type == "image"
+
+
+_HTML_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>初中数学教案</title>
+<style>p { color: red }</style></head>
+<body>
+<h1>二次函数</h1>
+<p>教学目标</p>
+<ul><li>理解顶点式</li><li>会用配方法</li></ul>
+<table><tr><th>形式</th><th>顶点</th></tr><tr><td>顶点式</td><td>(h, k)</td></tr></table>
+<script>var secret = 1;</script>
+<p>顶点式 y=a(x-h)^2+k 可直接读出顶点。</p>
+</body></html>
+"""
+
+
+class TestHtmlLoader:
+    """教案 / 试卷 HTML（新语料的主体格式）。
+
+    `meta` / `link` 是空元素：早先它们被放进"整段跳过"集合，自增不自减，
+    把整个文档吞成空串——所以这里显式放一个 `<meta charset>` 进 header 作回归。
+    """
+
+    def _load(self, tmp_path, html: str = _HTML_PAGE, name: str = "教案.html"):
+        from rag_system.document_loaders.loader_html import HtmlLoader
+
+        path = tmp_path / name
+        path.write_text(html, encoding="utf-8")
+        return HtmlLoader().load(path)
+
+    def test_structure_becomes_markdown(self, tmp_path):
+        doc = self._load(tmp_path)
+        assert "# 二次函数" in doc.text  # h1 → 一级标题
+        assert "教学目标" in doc.text  # meta charset 没有吞掉正文
+        assert "- 理解顶点式" in doc.text and "- 会用配方法" in doc.text  # li → 列表
+        assert "| 形式 | 顶点 |" in doc.text and "| 顶点式 | (h, k) |" in doc.text
+
+    def test_script_and_style_are_dropped(self, tmp_path):
+        doc = self._load(tmp_path)
+        assert "secret" not in doc.text  # MathJax/脚本留着就是脏 chunk
+        assert "color: red" not in doc.text
+
+    def test_title_and_inline_math_kept(self, tmp_path):
+        doc = self._load(tmp_path)
+        assert doc.title == "初中数学教案"  # <title> 供引用卡片用
+        assert "y=a(x-h)^2+k" in doc.text  # 行内公式原样保留
+
+    def test_subject_from_path(self, tmp_path):
+        folder = tmp_path / "01_textbook" / "初中" / "数学"
+        folder.mkdir(parents=True)
+        doc = self._load(folder, name="教材.html")
+        assert doc.subject == "数学"  # 学科只在目录里，文件名是通用词
+
+    def test_empty_html_raises(self, tmp_path):
+        empty = "<html><head><meta charset='utf-8'><title>空</title></head><body><script>a</script></body></html>"
+        with pytest.raises(LoaderError):
+            self._load(tmp_path, empty)
+
+
+class TestCorpusClassification:
+    """工厂按目录/文件名判 doc_type 与标题（新语料 `学科目录/教材.pdf` 结构）。"""
+
+    def _factory(self, **overrides):
+        from base.config import Settings
+        from rag_system.document_loaders.thy_factory import DocumentLoaderFactory
+
+        return DocumentLoaderFactory(Settings(MYSQL_PASSWORD="x", **overrides), None)
+
+    def test_doc_type_by_directory(self):
+        from pathlib import Path as P
+
+        from rag_system.document_loaders.thy_factory import _doc_type
+
+        assert _doc_type(P("datasets/10_exam_papers/初中/数学/试卷.html"), "other") == "exam"
+        assert _doc_type(P("datasets/01_textbook/高中/物理/教材.pdf"), "other") == "textbook"
+        assert _doc_type(P("datasets/02_lesson_plans/初中/英语/教案.html"), "other") == "lesson_plan"
+        assert _doc_type(P("datasets/01_textbook/初中/数学/随便.md"), "textbook") == "textbook"
+
+    def test_doc_type_by_filename_when_no_dir(self):
+        from pathlib import Path as P
+
+        from rag_system.document_loaders.thy_factory import _doc_type
+
+        assert _doc_type(P("F:/inbox/九年级数学试卷.pdf"), "other") == "exam"
+        assert _doc_type(P("F:/inbox/二次函数教案.docx"), "other") == "lesson_plan"
+        assert _doc_type(P("F:/inbox/读书笔记.md"), "other") == "other"
+
+    def test_generic_stem_gets_built_title(self):
+        from pathlib import Path as P
+
+        from rag_system.document_loaders.thy_factory import _title
+
+        # `教材.pdf` 直接当标题，前端会显示一排同名卡片，定位不到来源
+        assert _title(P("datasets/01_textbook/初中/数学/教材.pdf"), "textbook", "数学", "教材") == "初中数学教材"
+        assert _title(P("datasets/10_exam_papers/高中/物理/试卷.pdf"), "exam", "物理", "试卷") == "高中物理试卷"
+
+    def test_specific_title_is_kept(self):
+        from pathlib import Path as P
+
+        from rag_system.document_loaders.thy_factory import _title
+
+        assert _title(P("datasets/02_lesson_plans/初中/数学/教案.html"), "lesson_plan", "数学", "初中数学教案") == "初中数学教案"
+
+    def test_navigation_pages_are_skipped(self):
+        from pathlib import Path as P
+
+        factory = self._factory()
+        # 索引导航页与"本科目材料缺失"的告示都不是知识正文，进库只会被当成教材片段召回
+        assert not factory.is_supported(P("datasets/初高中教材教案试卷/索引.html"))
+        assert not factory.is_supported(P("datasets/01_textbook/初中/道德与法治/资源说明.html"))
+        assert factory.is_supported(P("datasets/02_lesson_plans/初中/数学/教案.html"))
+
+    def test_guess_subject_canonicalizes_aliases(self):
+        from rag_system.document_loaders.base import guess_subject
+
+        assert guess_subject("F:/datasets/01_textbook/高中/生物学/教材.pdf") == "生物"
+        assert guess_subject("F:/datasets/01_textbook/高中/思想政治/教材.pdf") == "道德与法治"
+        assert guess_subject("F:/datasets/01_textbook/初中/道德与法治/教材.pdf") == "道德与法治"
+        assert guess_subject("F:/datasets/x/未知.pdf") is None
+
+
+class TestStageAndGrade:
+    """新语料按 `阶段/学科/年级/` 三层组织：学段与年级必须能从路径认出来。
+
+    认不出的后果不是"少了两个字段"——`stage`/`grade` 是 Milvus 的标量字段，
+    识别失败会让整批文档落成空串，按年级过滤就永远查不到东西。
+    """
+
+    def test_stage_and_grade_from_path(self):
+        from pathlib import Path as P
+
+        from rag_system.document_loaders.thy_factory import _grade, _stage
+
+        root = P("datasets/初高中教材教案试卷-按年级")
+        assert _stage(root / "高中/数学/高一/教材.pdf") == "高中"
+        assert _grade(root / "高中/数学/高一/教材.pdf") == "高一"
+        assert _stage(root / "初中/化学/九年级/教材.pdf") == "初中"
+        assert _grade(root / "初中/化学/九年级/教材.pdf") == "九年级"
+
+    def test_grade_aliases_are_normalized(self):
+        from pathlib import Path as P
+
+        from rag_system.document_loaders.thy_factory import _grade
+
+        # `初三` / `高中一年级` 是同一年级的另一种写法，归一后才能当过滤值用
+        assert _grade(P("datasets/x/初中/数学/初三/教材.pdf")) == "九年级"
+        assert _grade(P("datasets/x/高中/物理/高中一年级/教材.pdf")) == "高一"
+
+    def test_unrecognized_stage_and_grade_are_none(self):
+        from pathlib import Path as P
+
+        from rag_system.document_loaders.thy_factory import _grade, _stage
+
+        # 认不出就是 None，不猜（与 subject 同一口径）
+        assert _grade(P("datasets/01_textbook/初中/数学/教材.pdf")) is None
+        assert _stage(P("datasets/杂项/资料/教材.pdf")) is None
+
+    def test_grade_distinguishes_titles(self):
+        from pathlib import Path as P
+
+        from rag_system.document_loaders.thy_factory import _title
+
+        # 同一学科的七/九两个年级目录下都是 `教材.pdf`：标题不带年级，
+        # 引用卡片上就是一排"初中数学教材"，用户分不清拿到的是哪本
+        seven = _title(P("datasets/c/初中/数学/七年级/教材.pdf"), "textbook", "数学", "教材")
+        nine = _title(P("datasets/c/初中/数学/九年级/教材.pdf"), "textbook", "数学", "教材")
+        assert seven == "初中七年级数学教材"
+        assert nine == "初中九年级数学教材"
+        assert seven != nine
+
+    def test_question_bank_and_review_paper_doc_types(self):
+        from pathlib import Path as P
+
+        from rag_system.document_loaders.thy_factory import _doc_type
+
+        root = P("datasets/初高中教材教案试卷-按年级")
+        # 认成 other 的话，`KB_STEPWISE` 的 `doc_type in [exam, …]` 过滤永远召不回它们
+        assert _doc_type(root / "初中/化学/九年级/题库.json", "other") == "question_bank"
+        assert _doc_type(root / "高中/数学/高三/复习卷.html", "other") == "exam"
+        assert _doc_type(root / "高中/数学/高三/试卷.pdf", "other") == "exam"
+
+
+class TestQuestionBankLoader:
+    """`题库.json` → 一题一段 Markdown（每道题一个 `###`）。"""
+
+    _ITEMS = [
+        {
+            "subject": "初中化学",
+            "ques_type": "填空题",
+            "ques_difficulty": "容易",
+            "ques_content": "题目内容: 水的化学式是____。",
+            "ques_answer": ["H2O"],
+            "ques_analyze": "水由氢氧两种元素组成。",
+            "ques_knowledges": ["水的组成"],
+        },
+        {
+            "subject": "初中化学",
+            "ques_type": "单选题",
+            "ques_difficulty": "一般",
+            "ques_content": "下列属于混合物的是（ ）。A.氧气 B.空气",
+            "ques_answer": ["B"],
+            "ques_analyze": "",
+            "ques_knowledges": [],
+        },
+    ]
+
+    def _write(self, path, payload):
+        import json
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def test_renders_one_section_per_question(self, tmp_path):
+        from rag_system.document_loaders.loader_question_bank import QuestionBankLoader
+
+        path = self._write(tmp_path / "题库.json", self._ITEMS)
+        doc = QuestionBankLoader().load(path)
+        assert doc.doc_type == "question_bank"
+        assert doc.meta["questions"] == 2
+        assert doc.text.count("### 第 ") == 2
+        assert "答案：H2O" in doc.text
+        assert "解析：水由氢氧两种元素组成。" in doc.text
+        assert "知识点：水的组成" in doc.text
+
+    def test_prefix_and_empty_analysis_are_cleaned(self, tmp_path):
+        from rag_system.document_loaders.loader_question_bank import QuestionBankLoader
+
+        path = self._write(tmp_path / "题库.json", self._ITEMS)
+        text = QuestionBankLoader().load(path).text
+        assert "题目内容:" not in text  # 前缀会把 318 道题的题首变成同一个词
+        # 空解析不渲染占位，否则"解析：（空）"会进索引
+        assert text.count("解析：") == 1
+
+    def test_subject_falls_back_to_json_field(self, tmp_path):
+        from rag_system.document_loaders.loader_question_bank import QuestionBankLoader
+
+        # 路径里没有学科目录时（临时文件）用 JSON 自带的 `初中化学`
+        doc = QuestionBankLoader().load(self._write(tmp_path / "题库.json", self._ITEMS))
+        assert doc.subject == "化学"
+
+    def test_non_bank_json_raises(self, tmp_path):
+        from rag_system.document_loaders.loader_question_bank import QuestionBankLoader
+
+        with pytest.raises(LoaderError):
+            QuestionBankLoader().load(self._write(tmp_path / "配置.json", {"a": 1}))
+        with pytest.raises(LoaderError):
+            QuestionBankLoader().load(self._write(tmp_path / "空.json", []))
+
+    def test_past_exam_schema_is_accepted(self, tmp_path):
+        """高中题库是另一套字段（高考真题）：`question / answer / analysis / year / source`。
+
+        只认 `ques_content` 的话，26 个高中题库会整体 LoaderError——那是语料里题量最大的一块。
+        """
+        from rag_system.document_loaders.loader_question_bank import QuestionBankLoader
+
+        items = [
+            {
+                "year": "2010",
+                "category": "（新课标）",
+                "question": "1. 已知集合 $A=\\{x \\mid x \\leqslant 2\\}$，则 $A \\cap B=$\nA. $(0,2)$\nB. $[0,2]$",
+                "answer": ["D"],
+                "analysis": "解：由交集定义可得。",
+                "source": "2010-2022_Math_I_MCQs.json",
+            }
+        ]
+        doc = QuestionBankLoader().load(self._write(tmp_path / "题库.json", items))
+        assert doc.doc_type == "question_bank"
+        assert "### 第 1 题" in doc.text
+        assert "年份：2010" in doc.text and "分类：（新课标）" in doc.text
+        assert "答案：D" in doc.text
+        assert "解析：解：由交集定义可得。" in doc.text
+        # 选项行必须留下：答案只有一个字母，删了选项这个字母就无所指
+        assert "A. $(0,2)$" in doc.text and "B. $[0,2]$" in doc.text
+
+    def test_partially_broken_bank_still_loads(self, tmp_path):
+        """一条空题不该把整份好题挡在库外，但序号要紧凑（不能留 `第 2 题` 的空洞）。"""
+        from rag_system.document_loaders.loader_question_bank import QuestionBankLoader
+
+        items = [
+            {"question": "第一题题干", "answer": ["A"]},
+            {"question": "", "answer": []},
+            {"question": "第三题题干", "answer": ["B"]},
+        ]
+        doc = QuestionBankLoader().load(self._write(tmp_path / "题库.json", items))
+        assert doc.meta["questions"] == 3
+        assert doc.meta["rendered"] == 2
+        assert "### 第 2 题\n第三题题干" in doc.text
+
+    def test_splitter_keeps_questions_apart(self, tmp_path):
+        """一道题一个父块：否则"引用到第 2 题"会连带第 1 题一起进上下文。"""
+        from rag_system.document_loaders.loader_question_bank import QuestionBankLoader
+        from rag_system.text_splitters.parent_child import ParentChildSplitter
+
+        path = self._write(tmp_path / "题库.json", self._ITEMS)
+        chunks = ParentChildSplitter().split(QuestionBankLoader().load(path))
+        parents: dict[str, str] = {}
+        for c in chunks:
+            parents[c.parent_id] = c.parent_text
+        first = [p for p in parents.values() if "水的化学式" in p]
+        assert len(first) == 1
+        assert "混合物" not in first[0]  # 第 2 题没有并进第 1 题的父块
+        assert all(c.meta["doc_type"] == "question_bank" for c in chunks)

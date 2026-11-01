@@ -15,19 +15,30 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import re
+import tempfile
 import time
 import zipfile
 from pathlib import Path
 
 import httpx
 
+from base.logger import get_logger
 from rag_system.document_loaders.base import BaseDocumentLoader, LoadedDoc, LoaderError, guess_subject
 
-_SUBJECTS = ("语文", "数学", "英语", "物理", "化学", "生物", "历史", "地理", "政治")
+log = get_logger(__name__)
 
 _IMAGE_MD = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _IMAGE_HTML = re.compile(r"<img\b[^>]*/?>", re.IGNORECASE)
+
+# MinerU 单文件页数上限。交付语料里 `高中/数学/教材.pdf` 270 页、`高中/历史/教材.pdf` 222 页，
+# 直接送会被拒（2026-10-29 实测 `number of pages exceeds limit (200 pages)`），
+# 而 `RAG_PDF_PARSER=auto` 会把它当成"云解析失败"静默退成本地 PyMuPDF——质量掉一半还看不出来。
+MAX_PAGES_PER_REQUEST = 200
+
+# 拆卷后每卷的 data_id 后缀分隔符：既用于上传名，也用于识别"这份是第几卷"
+_PART_SEP = "._part"
 
 
 def strip_images(markdown: str) -> str:
@@ -52,6 +63,16 @@ def content_hash(path: Path) -> str:
     return h.hexdigest()[:16]
 
 
+def _is_page_limit_error(exc: BaseException) -> bool:
+    """识别"页数超限"这一类拒收。
+
+    按文案匹配是没办法的办法（API 没有给错误码），所以只认两个稳定片段：
+    `exceeds limit` 与 `pages`。认错方向的代价是"多拆了一次"，比"整本退成本地解析"轻得多。
+    """
+    text = str(exc).lower()
+    return "exceeds limit" in text and "page" in text
+
+
 class MinerUClient:
     """MinerU v4 API 的最小客户端：申请上传链接 → PUT 上传 → 轮询 → 下载 zip。"""
 
@@ -65,6 +86,8 @@ class MinerUClient:
         timeout_s: int = 900,
         cache_dir: Path | None = None,
         http_timeout: float = 120.0,
+        upload_timeout_s: float = 900.0,
+        max_pages: int = MAX_PAGES_PER_REQUEST,
     ) -> None:
         if not token:
             raise LoaderError("MINERU_TOKEN 未配置，无法解析 PDF（在 .env 里填 token）")
@@ -74,7 +97,15 @@ class MinerUClient:
         self._poll_interval = max(1, poll_interval)
         self._timeout = timeout_s
         self._cache_dir = cache_dir
+        self._max_pages = max(1, max_pages)
         self._http = httpx.Client(timeout=http_timeout)
+        # 上传单独一条超时：`httpx` 的 `timeout=` 是**整条请求**（含写 body）的上限，
+        # 120 s 对 6–66 MB 的教材在上行带宽下必然写超时——2026-10-29 实测大量
+        # `WriteTimeout: The write operation timed out` 后静默退成本地 PyMuPDF（质量更低）。
+        # 只放宽写/读，连接与等池仍保持短超时：连不上就该立刻失败，而不是干等 15 分钟。
+        self._upload_timeout = httpx.Timeout(
+            connect=30.0, read=float(http_timeout), write=float(upload_timeout_s), pool=30.0
+        )
 
     # ---- 对外 ----
     def parse(self, pdf_path: Path) -> tuple[str, dict]:
@@ -85,7 +116,14 @@ class MinerUClient:
             meta["from_cache"] = True
             return markdown, meta
 
-        markdown, meta = self._parse_remote(pdf_path, digest)
+        try:
+            markdown, meta = self._parse_remote(pdf_path, digest)
+        except LoaderError as exc:
+            if not _is_page_limit_error(exc):
+                raise
+            # 超页数**不是失败**，是"这份要拆开发"：拆卷后每卷都不超限，
+            # 按顺序拼回同一份 markdown，缓存仍记在原文件的 digest 上
+            markdown, meta = self._parse_split(pdf_path, digest, str(exc))
         self._save_cache(digest, markdown, meta)
         meta["from_cache"] = False
         return markdown, meta
@@ -107,9 +145,20 @@ class MinerUClient:
         batch_id = data["data"]["batch_id"]
         upload_url = data["data"]["file_urls"][0]
 
-        # 注意：这个 PUT 是预签名 URL，带 Authorization 反而会 403
+        # 注意：
+        # 1. 这个 PUT 是 OSS 预签名 URL，**带 Authorization 会 403**；
+        # 2. **也不要带 `Content-Type`**——签名把 content-type 算进去了，改成 application/pdf
+        #    会让服务端直接断开连接（2026-10-29 实测：POST 200 → PUT `RemoteProtocolError`）。
+        #    只显式给 `Content-Length`：预签名 URL 走对象存储，chunked 上传会被判签名不符。
+        # 3. 传**文件对象**而不是 `read()` 出来的 bytes：httpx 会流式发送，
+        #    66 MB 的教材不用先整体读进内存（同时也让 write 超时真正按"写"计时）。
         with pdf_path.open("rb") as fh:
-            put = self._http.put(upload_url, content=fh.read())
+            put = self._http.put(
+                upload_url,
+                content=fh,
+                headers={"Content-Length": str(pdf_path.stat().st_size)},
+                timeout=self._upload_timeout,
+            )
         if put.status_code >= 400:
             raise LoaderError(f"MinerU 上传失败 HTTP {put.status_code}：{put.text[:200]}")
 
@@ -122,6 +171,80 @@ class MinerUClient:
         zip_bytes = self._http.get(done[0]["full_zip_url"]).content
         markdown, pages, images = self._unpack(zip_bytes, digest)
         return markdown, {"batch_id": batch_id, "pages": pages, "images": images, "digest": digest}
+
+    def _parse_split(self, pdf_path: Path, digest: str, reason: str) -> tuple[str, dict]:
+        """把超页数的 PDF 拆成 ≤`max_pages` 的若干卷，逐卷云端解析后按序拼接。
+
+        为什么在客户端里做而不是让调用方处理：调用方（工厂）只知道"这份 PDF 要用哪个解析器"，
+        不知道云端的上限；把拆卷藏在这里，`auto` 模式就不会再因为页数把教材降级成本地解析。
+
+        分卷用 PyMuPDF 写临时文件（`datasets/` 只读，绝不能就地改）。临时目录用完即删；
+        每卷的抽取目录也一并清掉，缓存目录里只留最终合并的那一份，免得 `data/mineru/` 里
+        多出一堆 `.*._partN` 目录、把"已缓存多少本"数错。
+        """
+        import fitz  # PyMuPDF：拆卷只用到它，没装就不该走到这条路
+
+        doc = fitz.open(str(pdf_path))
+        try:
+            total = doc.page_count
+            parts = math.ceil(total / self._max_pages)
+            if parts <= 1:
+                raise LoaderError(f"MinerU 拒收但页数只有 {total}：{reason}")
+
+            datas: list[dict] = []
+            chunks: list[str] = []
+            with tempfile.TemporaryDirectory(prefix="mineru_split_") as tmp:
+                tmp_dir = Path(tmp)
+                for i in range(parts):
+                    start = i * self._max_pages
+                    end = min(start + self._max_pages, total)
+                    part_pdf = tmp_dir / f"{pdf_path.stem}{_PART_SEP}{i + 1}.pdf"
+                    part = fitz.open()
+                    part.insert_pdf(doc, from_page=start, to_page=end - 1)
+                    part.save(str(part_pdf))
+                    part.close()
+
+                    part_key = f"{digest}{_PART_SEP}{i + 1}"
+                    markdown, meta = self._parse_remote(part_pdf, part_key)
+                    chunks.append(markdown)
+                    datas.append(meta)
+                    log.info(
+                        "mineru_part_ok",
+                        file=pdf_path.name,
+                        part=i + 1,
+                        parts=parts,
+                        pages=end - start,
+                    )
+                    self._drop_extract(part_key)
+        finally:
+            doc.close()
+
+        markdown = "\n\n---\n\n".join(chunks)
+        return markdown, {
+            "split": parts,
+            "pages": sum(int(d.get("pages", 0)) for d in datas),
+            "images": sum(int(d.get("images", 0)) for d in datas),
+            "digest": digest,
+            "batches": [d.get("batch_id") for d in datas],
+            "split_reason": reason,
+        }
+
+    def _drop_extract(self, key: str) -> None:
+        """删掉某一卷的抽取目录（只删自己刚建的，缓存根目录不动）。"""
+        if self._cache_dir is None:
+            return
+        target = self._cache_dir / key
+        if not target.is_dir():
+            return
+        for child in sorted(target.rglob("*"), reverse=True):
+            try:
+                child.rmdir() if child.is_dir() else child.unlink()
+            except OSError:
+                pass
+        try:
+            target.rmdir()
+        except OSError:
+            pass
 
     def _poll(self, batch_id: str, headers: dict) -> list[dict]:
         deadline = time.time() + self._timeout
@@ -202,7 +325,7 @@ class PdfLoader(BaseDocumentLoader):
             text=markdown,
             source=str(p),
             doc_type="textbook",
-            subject=guess_subject(p.name, _SUBJECTS),
+            subject=guess_subject(str(p)),
             title=p.stem,
             meta=meta,
         )

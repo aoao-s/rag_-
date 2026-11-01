@@ -51,11 +51,17 @@ def test_extract_single_and_multi() -> None:
 def test_extract_unknown_and_grade() -> None:
     assert qa_slots.extract("学费多少钱").subject_source == "unknown"
 
+    # 年级出口是 `labels.GRADES` 的规范名（初二 → 八年级）：Milvus 的 grade 字段、
+    # `Atom.grade`、引用卡片全用这一套写法，抽出来的槽位也必须用，否则按年级任何比较都零命中
     graded = qa_slots.extract("初二数学怎么学")
-    assert graded.subject == "数学" and graded.grade == "初二"
+    assert graded.subject == "数学" and graded.grade == "八年级"
 
     seven = qa_slots.extract("七年级的地理难吗")
     assert seven.subject == "地理" and seven.grade == "七年级"
+
+    # 已经是规范名的原样保留，不再二次改写
+    assert qa_slots.extract("九年级数学函数").grade == "九年级"
+    assert qa_slots.extract("高2物理").grade == "高二"
 
 
 def test_resolve_priority() -> None:
@@ -66,6 +72,65 @@ def test_resolve_priority() -> None:
     # 问句没有学科时用历史提示，并明确标成 context（不直接答）
     context = qa_slots.resolve("怎么复习", history_hint="数学")
     assert context.subject == "数学" and context.subject_source == "context"
+
+
+# --------------------------------------------------------------------------- 冲突
+def test_param_and_query_disagree_becomes_conflict_not_silent_param() -> None:
+    """参数说化学、问句说数学：两边都是用户写的字，选谁都是替他猜。
+
+    静默采信参数的失败形状不是报错，而是**用错的学科做了硬过滤**——正确证据被挡在
+    索引外面，而且事后从响应体里完全看不出来（`explicit / 化学` 看起来像一次正常的
+    参数指定）。所以结论必须是"不选边"：学科清空、检索退回全库。
+    """
+    slots = qa_slots.resolve("数学的二次函数怎么求", param="化学")
+    assert slots.subject_source == "conflict"
+    assert slots.subject is None
+    assert slots.subjects == ()
+    assert slots.scope == ()  # 空 = 全库，`_context()` 据此不加 subject 过滤
+    assert slots.subject_confidence == 0.0
+
+
+def test_conflict_keeps_the_non_subject_slots_from_the_query() -> None:
+    """冲突只清学科。年级、章节、任务参数照旧来自问句——它们与"查哪一门"无关。"""
+    slots = qa_slots.resolve("初二数学的二次函数，出5道题", param="化学")
+    assert slots.subject_source == "conflict"
+    assert slots.subject is None
+    assert slots.grade == "八年级"
+    assert slots.task.exam.question_count == 5
+
+
+def test_conflict_covers_multi_subject_queries() -> None:
+    """问句点名多门而参数不在这几门里，同样算冲突（不能只比 `subject` 第一个）。"""
+    slots = qa_slots.resolve("物理和化学有什么区别", param="历史")
+    assert slots.subject_source == "conflict"
+    assert slots.scope == ()
+
+
+def test_param_inside_a_multi_subject_query_is_not_a_conflict() -> None:
+    """"数学和物理的题" + `param=数学`：用户只是没把话说全，参数照旧生效。
+
+    这不是矛盾而是收窄，且是用户明确要求的；把它判成冲突等于把他指定的一门丢掉，
+    两边都查一遍——比他要的更费预算，也更不精确。
+    """
+    slots = qa_slots.resolve("数学和物理的题目怎么讲", param="数学")
+    assert slots.subject_source == "explicit"
+    assert slots.subject == "数学"
+
+
+def test_history_hint_never_conflicts_with_the_query() -> None:
+    """上一轮聊数学、这一轮问化学：主题切换是正常对话，不是冲突。
+
+    这一轮说的算这一轮的——拿历史去否决用户当前写下的学科，正是"指代借用"
+    那条错误过滤的另一种翻身方式。
+    """
+    slots = qa_slots.resolve("化学方程式怎么配平", history_hint="数学")
+    assert slots.subject_source == "explicit"
+    assert slots.subject == "化学"
+
+
+def test_conflict_does_not_mask_an_invalid_param() -> None:
+    """参数不在词表时仍是 `invalid`：它要被 400 暴露，不能被问句或冲突态盖住。"""
+    assert qa_slots.resolve("数学的二次函数", param="物理课").subject_source == "invalid"
 
 
 # --------------------------------------------------------------------------- 路由

@@ -16,7 +16,7 @@ from rag_system.store.milvus_store import Hit
 def _settings(tmp_path: Path, **kw) -> Settings:
     base = dict(
         mysql_password="123456",
-        milvus_uri="http://127.0.0.1:19531",
+        milvus_uri="http://127.0.0.1:19541",
         rag_top_k=10,
         rag_final_n=3,
         rag_rerank_enabled="true",

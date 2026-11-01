@@ -72,7 +72,14 @@ def _pipeline(tmp_path: Path, docs: list[LoadedDoc]) -> tuple[IngestPipeline, Fa
             )
         },
     )()
-    pipe = IngestPipeline(_settings(tmp_path), store=store, embedder=FakeEmbedder(), factory=factory)
+    pipe = IngestPipeline(
+        _settings(tmp_path),
+        store=store,
+        embedder=FakeEmbedder(),
+        factory=factory,
+        # 指纹文件指到 tmp：否则单测会往仓库的 data/ 里写真实指纹，并跨用例互相干扰
+        fingerprint_path=tmp_path / "doc_fingerprints.json",
+    )
     return pipe, store
 
 

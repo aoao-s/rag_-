@@ -24,7 +24,6 @@ from pathlib import Path
 from rag_system.document_loaders.base import BaseDocumentLoader, LoadedDoc, LoaderError, guess_subject
 from rag_system.document_loaders.ocr import ocr_array, ocr_available
 
-_SUBJECTS = ("语文", "数学", "英语", "物理", "化学", "生物", "历史", "地理", "政治")
 
 IMAGE_AREA_RATIO = 0.10  # 图占页面面积低于 10% 视为装饰图
 IMAGE_MIN_SIDE = 64  # PDF 点（1/72 inch）
@@ -95,7 +94,7 @@ class LocalPdfLoader(BaseDocumentLoader):
             text=body,
             source=str(p),
             doc_type="textbook",
-            subject=guess_subject(p.name, _SUBJECTS),
+            subject=guess_subject(str(p)),
             title=p.stem,
             meta={"pages": total, "ocr_pages": ocr_pages, "parser": "pymupdf"},
         )

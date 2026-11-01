@@ -205,6 +205,44 @@ def _recall_at(runs: list[dict], rel: float, k: int) -> float:
     return round(hit / max(len(runs), 1), 4)
 
 
+def _first_rank(r: dict, rel: float, k: int) -> int:
+    """第一条相关证据的名次（1 起）；k 条内没有就返回 0。"""
+    for i, e in enumerate(r["evidences"][:k], start=1):
+        if e["cov"] >= rel:
+            return i
+    return 0
+
+
+def _mrr_at(runs: list[dict], rel: float, k: int) -> float:
+    """MRR@k：第一条相关证据名次的倒数的均值。
+
+    与 Recall 互补——召回只看"10 条里有没有"，MRR 看"排得够不够前"。
+    两者一起下降说明召回没找到；召回高而 MRR 低说明找到了但被噪声压在后面，
+    那是排序（重排 / 融合权重）的问题，不是语料的问题。
+    """
+    total = sum(1.0 / rank for r in runs if (rank := _first_rank(r, rel, k)))
+    return round(total / max(len(runs), 1), 4)
+
+
+def _ndcg_at(runs: list[dict], rel: float, k: int) -> float:
+    """nDCG@k（二值相关性：cov ≥ rel 记 1）。
+
+    与 MRR 的区别是它把**后续相关证据**也算进去：一条问题若在 top-10 里有 3 条相关证据，
+    MRR 与只有 1 条时相同，nDCG 更高。理想排序 IDCG 按"本次实际检出的相关证据数"算，
+    否则语料不齐时（相关证据本来就少）会把分数压到没有意义。
+    """
+    import math
+
+    total = 0.0
+    for r in runs:
+        rels = [1 if e["cov"] >= rel else 0 for e in r["evidences"][:k]]
+        dcg = sum(rel_i / math.log2(i + 1) for i, rel_i in enumerate(rels, start=1))
+        ideal = sorted(rels, reverse=True)
+        idcg = sum(rel_i / math.log2(i + 1) for i, rel_i in enumerate(ideal, start=1))
+        total += dcg / idcg if idcg else 0.0
+    return round(total / max(len(runs), 1), 4)
+
+
 def _calibrate(rel: float, target_wrong: float) -> int:
     runs = _load_runs()
     if not runs:
@@ -227,6 +265,9 @@ def _calibrate(rel: float, target_wrong: float) -> int:
     current = next((r for r in rows if abs(r["t"] - 0.35) < 1e-9 and abs(r["m"] - 0.03) < 1e-9 and r["qc"] == 0.0), None)
 
     r_at = {k: _recall_at(runs, rel, k) for k in (1, 3, 6, 10)}
+    mrr10 = _mrr_at(runs, rel, 10)
+    ndcg10 = _ndcg_at(runs, rel, 10)
+    print(f"== Recall@10={r_at[10]}  MRR@10={mrr10}  nDCG@10={ndcg10}")
     latencies = sorted(r["cost_ms"] for r in runs)
     p50 = latencies[len(latencies) // 2]
     p95 = latencies[int(len(latencies) * 0.95) - 1] if len(latencies) > 1 else latencies[0]
@@ -241,6 +282,7 @@ def _calibrate(rel: float, target_wrong: float) -> int:
     lines.append(f"- 相关性判据：某条证据对黄金事实的词覆盖 ≥ **{rel}**（`contexts` 是事实依据，不是原文）")
     lines.append(f"- 检索：融合分（无重排），top_k=40 / final_n=10，CPU 上 p50 {p50} ms / p95 {p95} ms")
     lines.append(f"- Recall@1 / @3 / @6 / @10（全样本）：**{r_at[1]} / {r_at[3]} / {r_at[6]} / {r_at[10]}**")
+    lines.append(f"- MRR@10 / nDCG@10（全样本）：**{mrr10} / {ndcg10}**")
     lines.append(f"- top1 证据对黄金事实的平均覆盖：{avg_cov_top1:.3f}")
     lines.append("")
     lines.append("> 召回率低主要是**语料不齐**：当前语料只有 6 份短教材 + 6 份教案 + 1 本九年级数学 PDF，")

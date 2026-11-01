@@ -87,3 +87,38 @@ def test_child_block_inherits_heading() -> None:
     doc = LoadedDoc(text="# 一、函数\n函数定义。\n## 1.2 图像\n图像是抛物线。", source="F:/x/a.md", title="a")
     chunks = ParentChildSplitter(SplitterConfig(parent_size=200, child_size=100)).split(doc)
     assert any("1.2 图像" in c.heading for c in chunks)
+
+
+def test_unpunctuated_block_is_hard_split() -> None:
+    """没有标点的长串（MinerU 的表格行、公式行）必须被硬切到 size 以内。
+
+    2026-10-29 实测：教材 PDF 经 MinerU 解析后切出过 **12 140 字**的子块，
+    被 Milvus 的 `text`（max_length=4096）整份拒收，18 本教材入库全失败。
+    """
+    body = "|" + "1" * 1200 + "|"  # 一句 1202 字，没有任何句末标点
+    doc = LoadedDoc(text="# 一、函数\n" + body, source="F:/x/a.md", title="a")
+    chunks = ParentChildSplitter(
+        SplitterConfig(parent_size=300, parent_overlap=30, child_size=80, child_overlap=10)
+    ).split(doc)
+    assert chunks
+    for c in chunks:
+        assert len(c.text) <= 80 + 40
+        assert len(c.parent_text) <= 300 + 40
+
+
+def test_hard_split_keeps_overlap_and_length() -> None:
+    from rag_system.text_splitters.parent_child import _hard_split
+
+    pieces = _hard_split("x" * 250, size=100, overlap=20)
+    assert [len(p) for p in pieces] == [100, 100, 90]
+    assert pieces[0][-20:] == pieces[1][:20]  # 相邻片段真的重叠
+    assert _hard_split("短句。", size=100, overlap=20) == ["短句。"]
+
+
+def test_hard_split_survives_overlap_larger_than_size() -> None:
+    """overlap ≥ size 时不能原地打转（step 会退化成 0，循环写不完）。"""
+    from rag_system.text_splitters.parent_child import _hard_split
+
+    pieces = _hard_split("y" * 100, size=10, overlap=50)
+    assert len("".join(pieces)) > 0
+    assert "".join(pieces).startswith("y" * 10)

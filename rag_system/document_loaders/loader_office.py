@@ -20,7 +20,6 @@ from typing import Iterator
 from rag_system.document_loaders.base import BaseDocumentLoader, LoadedDoc, LoaderError, guess_subject
 from rag_system.document_loaders.ocr import ocr_image_bytes
 
-_SUBJECTS = ("语文", "数学", "英语", "物理", "化学", "生物", "历史", "地理", "政治")
 
 
 def _table_to_markdown(rows: list[list[str]]) -> str:
@@ -86,7 +85,7 @@ class DocxLoader(BaseDocumentLoader):
             text=text,
             source=str(p),
             doc_type="lesson_plan",
-            subject=guess_subject(p.name, _SUBJECTS),
+            subject=guess_subject(str(p)),
             title=p.stem,
             meta={"blocks": len(parts), "ocr_images": self._ocr_images},
         )
@@ -127,7 +126,7 @@ class PptxLoader(BaseDocumentLoader):
             text=text,
             source=str(p),
             doc_type="lesson_plan",
-            subject=guess_subject(p.name, _SUBJECTS),
+            subject=guess_subject(str(p)),
             title=p.stem,
             meta={"slides": len(presentation.slides), "ocr_images": self._ocr_images},
         )

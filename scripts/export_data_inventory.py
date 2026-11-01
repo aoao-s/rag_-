@@ -139,7 +139,7 @@ def sheet_overview() -> tuple[list[str], list[list[str]], list[int], int]:
         ["14", "向量数据", "Milvus 父子块集合", "已建", "15 文件 / 622 子块（2026-10-20 实测）", "MILVUS_URI 的 edurag.edurag_chunk", "1024 维稠密 + 稀疏倒排，HNSW"],
         ["15", "热数据", "Redis FAQ 二级缓存", "已建", "正缓存 + 30 s 负缓存", "edurag:{env}:faq:v{版本}:{范围}:{摘要}", "TTL 1 h，绝对寿命 6 h，命中续期"],
         ["16", "热数据", "Redis 规划键族", "规划中", "语义缓存/会话/限流/锁/记忆/事件流", "CLAUDE.md §6.4", "详见「05-Redis键」"],
-        ["17", "模型权重", "BGE-M3 / Reranker / 意图 BERT", "部分已有", "约 4–5 GB 显存", "../Ragpro/rag_system/models + MODELS_DIR", "意图模型需先用 06_intent 训练"],
+        ["17", "模型权重", "BGE-M3 / Reranker / 意图 BERT", "部分已有", "约 4–5 GB 显存", "rag_system/models（本仓库）+ MODELS_DIR", "意图模型需先用 06_intent 训练"],
         ["18", "外部服务", "DeepSeek / MinerU / MinIO", "部分接入", "LLM 与 MinerU 已接，MinIO 未接", ".env", "密钥只从环境注入，不入库"],
         ["19", "标定产出", "阈值 / 敏感度报告", "部分失效", "3 份报告 + 2 份跑批", "docs/analysis/", "RAG 报告有效；FAQ 阈值结论已失效"],
         ["20", "运行留档", "结构化日志", "在线", "50 MB × 10 份轮转", "logs/app.log + stdout", "生产 LOG_QUERY_TEXT=false"],
@@ -396,7 +396,7 @@ def sheet_redis() -> tuple[list[str], list[list[str]], list[int], int]:
 def sheet_eval() -> tuple[list[str], list[list[str]], list[int], int]:
     headers = ["数据集 / 产出", "用途", "现有规模", "要求规模", "字段", "状态", "结论 / 备注"]
     rows = [
-        ["datasets/07_eval/ragas_eval.jsonl", "RAGAS 评估 + 证据门标定", "1 000 条", "≥300 题（覆盖 6 类意图）", "question / ground_truth / contexts / intent", "已有", "6 类分布：知识点 351、题目讲解 136、教案素材 106、备课 90、学习方法 80、闲聊 237"],
+        ["datasets/07_eval/ragas_eval.jsonl", "RAGAS 评估 + 证据门标定", "1 000 条", "≥300 题（覆盖 7 类意图）", "question / ground_truth / contexts / intent", "已有", "仍是旧 6 类口径：知识点 351、题目讲解 136、教案素材 106、备课 90、学习方法 80、闲聊 237；**「超出范围」类 0 条**，新口径下需补],
         ["docs/analysis/rag_eval_runs.jsonl", "证据门标定原始跑批", "763 条可判定", "可复跑", "含每题 top-10 证据与 qcov", "已标定", "→ 阈值 0.74 / margin 0.01 / qcov 0.20；可答放行 34%、误放 3%"],
         ["docs/analysis/rag_threshold_report.md", "证据门标定报告", "1 份", "—", "—", "已标定", "黄金集覆盖 7–9 年级，库内仅 1 本九年级数学，Recall 上限受语料限制"],
         ["docs/analysis/faq_paraphrases.jsonl", "FAQ 阈值标定正/负样本", "480 条", "正 ≥600 + 负 ≥300", "faq_id / subject / original / paraphrase", "失效", "480/480 的 faq_id 与当前 2 000 条正文不一致，按现文件跑 precision=0"],
@@ -414,7 +414,7 @@ def sheet_eval() -> tuple[list[str], list[list[str]], list[int], int]:
 def sheet_models() -> tuple[list[str], list[list[str]], list[int], int]:
     headers = ["名称", "类型", "路径 / 端点", "规模", "设备 / 部署", "加载或调用时机", "状态"]
     rows = [
-        ["BAAI/bge-m3", "向量模型（稠密 1024 维 + 稀疏）", "RAG_EMBED_MODEL_PATH（默认 ../Ragpro/rag_system/models/BAAI/bge-m3）", "约 2.5 GB 显存（FP16）", "GPU 常驻", "启动时加载并预热；请求路径零加载", "已有（CPU 可跑）"],
+        ["BAAI/bge-m3", "向量模型（稠密 1024 维 + 稀疏）", "RAG_EMBED_MODEL_PATH（默认 rag_system/models/BAAI/bge-m3）", "约 2.5 GB 显存（FP16）", "GPU 常驻", "启动时加载并预热；请求路径零加载", "已有（CPU 可跑）"],
         ["BAAI/bge-reranker-v2-m3", "精排模型（568 M）", "RAG_RERANKER_PATH", "约 1.5 GB 显存（FP16）", "GPU 批量；CPU 上 40 候选约 4.5 s", "启动时加载（有 CUDA 才启用）", "已有"],
         ["意图分类 BERT-small", "分类模型（K12 6 类）", "MODELS_DIR / ONNX Runtime", "<0.3 GB", "GPU 或 CPU", "启动时加载；失败降级为规则", "待训练（数据已备）"],
         ["DeepSeek LLM", "生成 / 路由 / 抽取 / 摘要", "LLM_BASE_URL + LLM_API_KEY", "外部 API，无显存占用", "外部服务", "请求路径流式调用；首 token ≤600 ms", "未接入"],
@@ -422,7 +422,7 @@ def sheet_models() -> tuple[list[str], list[list[str]], list[int], int]:
         ["PyMuPDF 本地解析", "PDF 兜底解析", "stdlib 包 fitz", "—", "本地进程", "云解析失败自动降级", "已接入"],
         ["RapidOCR", "图片/扫描页 OCR", "rapidocr_paddle → rapidocr_onnxruntime", "—", "GPU 优先，CPU 兜底", "摄入期调用（RAG_OCR_IMAGES 控制）", "已接入"],
         ["jieba + 领域词典", "中文分词（FAQ BM25）", "qa_system/res/qa_normalize.py", "内存索引", "进程内", "启动时建一次，请求期不加载", "已接入"],
-        ["Milvus 2.4", "向量数据库", "MILVUS_URI（默认 http://127.0.0.1:19531）", "—", "docker（etcd + minio + milvus + attu）", "启动时建库建集合并 load", "已接入"],
+        ["Milvus 2.4", "向量数据库", "MILVUS_URI（默认 http://127.0.0.1:19541）", "—", "docker（etcd + minio + milvus + attu）", "启动时建库建集合并 load", "已接入"],
         ["MySQL 8.0", "关系库（真相源）", "MYSQL_HOST:MYSQL_PORT（默认 3307）", "—", "docker", "启动时建连接池", "已接入"],
         ["Redis 7/8", "缓存 / 会话 / 限流", "REDIS_HOST:REDIS_PORT（默认 6380）", "—", "docker", "启动 ping 失败即降级", "已接入"],
         ["MinIO", "对象存储（原始文档）", "MINIO_ENDPOINT / ACCESS_KEY / SECRET_KEY / BUCKET", "—", "docker", "摄入期存原文与解析中间件", "未接入"],
@@ -438,7 +438,7 @@ def sheet_config() -> tuple[list[str], list[list[str]], list[int], int]:
         ["MYSQL_HOST/PORT/USER/PASSWORD/DATABASE", "127.0.0.1 / 3307 / root / — / rag_sbc", "MySQL 连接（同时是 compose 启动参数）", "存储", "密码为空则启动自检失败"],
         ["MYSQL_POOL_MAX", "16", "连接池上限", "存储", "—"],
         ["REDIS_HOST/PORT/PASSWORD/DB", "127.0.0.1 / 6380 / — / 0", "Redis 连接（密码同时用于容器 requirepass）", "存储", "不可用时降级为进程内缓存"],
-        ["MILVUS_URI / DATABASE / COLLECTION", "http://127.0.0.1:19531 / edurag / edurag_chunk", "向量库连接与集合", "存储", "集合不存在则 RAG 不就绪（FAQ 不受影响）"],
+        ["MILVUS_URI / DATABASE / COLLECTION", "http://127.0.0.1:19541 / edurag / edurag_chunk", "向量库连接与集合", "存储", "集合不存在则 RAG 不就绪（FAQ 不受影响）"],
         ["MILVUS_DIM", "1024", "稠密向量维度", "存储", "换嵌入模型必须同步改"],
         ["MILVUS_TOKEN", "空", "Milvus 鉴权 token", "存储", "本地 standalone 为空"],
         ["FAQ_THRESHOLD", "0.25", "归一化分数绝对门槛（0.25 ⟺ 原始分 4.0）", "qa_system", "重标定前仅作保守兜底"],
@@ -469,8 +469,8 @@ def sheet_config() -> tuple[list[str], list[list[str]], list[int], int]:
         ["RAG_RERANK_CANDIDATES", "40", "送入重排的候选数", "rag_system", "—"],
         ["RAG_RERANK_CHARS / MAX_LENGTH", "2000 / 512", "重排输入截断", "rag_system", "约 512 token"],
         ["RAG_EMBED_BACKEND", "auto", "auto=真模型 / hash=确定性哈希（只验证管线）", "rag_system", "—"],
-        ["RAG_EMBED_MODEL_PATH", "../Ragpro/.../bge-m3", "稠密+稀疏向量模型路径", "rag_system", "—"],
-        ["RAG_RERANKER_PATH", "../Ragpro/.../bge-reranker-v2-m3", "精排模型路径", "rag_system", "—"],
+        ["RAG_EMBED_MODEL_PATH", "rag_system/models/BAAI/bge-m3", "稠密+稀疏向量模型路径", "rag_system", "—"],
+        ["RAG_RERANKER_PATH", "rag_system/models/BAAI/bge-reranker-v2-m3", "精排模型路径", "rag_system", "—"],
         ["RAG_EMBED_DEVICE", "auto", "cuda / cpu / auto", "rag_system", "—"],
         ["RAG_EMBED_FP16 / RAG_USE_FP16", "true / true", "半精度（CPU 上 fp16 会报错）", "rag_system", "—"],
         ["RAG_EMBED_BATCH_SIZE / MAX_LENGTH", "8 / 512", "向量化批大小与截断", "rag_system", "OOM 时下调"],
@@ -507,7 +507,7 @@ def sheet_gaps() -> tuple[list[str], list[list[str]], list[int], int]:
         ["10", "意图口径已定案（原缺口关闭）", "数据集 6 类（K12 教学）vs 文档 5 类（招生）", "2026-10-26 统一定为 K12 6 类（CLAUDE.md §3.2 / §7.7）", "文档已同步，`INTENT_LABELS` 本就是 6 类，无需改代码", "保持 `INTENT_LABELS` 为唯一出处；待训练分类器", "已关闭"],
         ["11", "教材语料覆盖不足", "6 份章节 + 1 本 PDF", "黄金集覆盖的 7–9 年级各学科都有", "可答题里只有约 20% 能召回正确文档", "按黄金集学科/年级补齐语料后重标证据门", "P0"],
         ["12", "黄金集未接 CI", "手工跑 eval_rag.py", "合并前自动跑 Recall/MRR/忠实度，超阈值阻断", "回归退化无人拦", "CI 里加 eval 任务 + 基线文件", "P2"],
-        ["13", "题库未接入在线链路", "15 865 道只在 datasets", "题库 collection / MySQL", "题目讲解类问题只能走文档检索", "定义题库 schema 与检索接口", "P2"],
+        ["13", "题库未接入在线链路", "15 865 道只在 datasets", "题库 collection / MySQL", "学习讲解类问题只能走文档检索", "定义题库 schema 与检索接口", "P2"],
         ["14", "SFT 语料过少", "50 条", "6 万条（目标）", "无法微调出可用模型", "用 download_opensource 扩充", "P2"],
         ["15", "忠实度抽检未运行", "0", "每日 100 条，编造率 ≤2%", "无法证明「不编造」这条 P0 承诺", "生成链路接通后加离线抽检任务", "P1"],
     ]

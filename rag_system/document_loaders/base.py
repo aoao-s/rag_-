@@ -11,9 +11,12 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from base.labels import SUBJECTS, SUBJECT_ALIASES
 
 
 class LoaderError(RuntimeError):
@@ -31,6 +34,9 @@ class LoadedDoc:
         subject: 学科（数学/物理/...）；识别不出时为 None，不硬猜。
         title: 文档标题，用于引用卡片展示。
         meta: 其余元数据（PDF 的页数、MinerU 的 batch_id 等）。
+        stage / grade: 学段（初中/高中）与年级（七年级…高三）。新语料按
+            `阶段/学科/年级/` 组织，这两层是**检索过滤与引用定位的必需字段**；
+            认不出时留 None，不硬猜（与 `subject` 同一口径）。
     """
 
     text: str
@@ -39,6 +45,8 @@ class LoadedDoc:
     subject: str | None = None
     title: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
+    stage: str | None = None
+    grade: str | None = None
 
     @property
     def name(self) -> str:
@@ -72,19 +80,37 @@ def read_text(path: Path, encodings: Iterable[str] = ("utf-8-sig", "utf-8", "gbk
     raise LoaderError(f"无法识别文件编码 {path}：{last_error}")
 
 
-def guess_subject(name: str, subjects: Iterable[str]) -> str | None:
-    """从文件名里认出学科。
+def guess_subject(name: str, subjects: Iterable[str] | None = None) -> str | None:
+    """从文件名/路径里认出学科，返回 `SUBJECTS` 里的规范名。
 
-    先按 '-'/'_'/' ' 切词找完整命中的 token（数据集是"数学-九年级-二次函数.md"这种格式），
-    再退回整串子串匹配（"二次函数入门-字幕.srt"这种省略了学科前缀的命名）。
-    都认不出返回 None——交给入库统计暴露，而不是默认成某个学科。
+    三级匹配，从确定到宽松：
+
+    1. 按分隔符切词、找**完整命中**的 token（`数学-九年级-二次函数.md`、`初中-数学-教材.pdf`）；
+    2. 整串子串匹配，**长写法优先**（"思想政治" 必须先于 "政治"，否则永远先命中别名前缀）；
+    3. 都认不出返回 `None`——交给入库统计暴露，而不是默认成某个学科。
+
+    `subjects=None` 时用 `base/labels.py` 的词表与别名表（学科写法的唯一出处）；
+    调用方传自定义词表时只认该表，别名仍会做归一但必须落在表内。
+
+    为什么接受整条路径而不只是文件名：新语料是 `初中/数学/教材.pdf` 这种
+    "学科在目录、文件名是通用词"的结构，只看 `p.name` 会让 54 篇文档全部 subject=None。
     """
-    subjects = tuple(subjects)
-    for token in name.replace("_", "-").replace(" ", "-").split("-"):
-        token = token.strip()
-        if token in subjects:
-            return token
-    for subject in subjects:
-        if subject in name:
-            return subject
+    candidates: tuple[str, ...] = tuple(subjects) if subjects is not None else SUBJECTS
+
+    def canon(token: str) -> str | None:
+        token = token.strip().removesuffix("学科").strip()
+        mapped = SUBJECT_ALIASES.get(token, token)
+        return mapped if mapped in candidates else None
+
+    for token in re.split(r"[-_/\\\s.,，、（）()【】]+", name):
+        hit = canon(token)
+        if hit:
+            return hit
+
+    vocabulary = set(candidates) | set(SUBJECT_ALIASES) if subjects is None else set(candidates)
+    for word in sorted(vocabulary, key=len, reverse=True):
+        if word in name:
+            hit = canon(word)
+            if hit:
+                return hit
     return None

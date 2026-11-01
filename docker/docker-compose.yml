@@ -125,7 +125,7 @@ services:
       MINIO_ADDRESS: minio:9000
       TZ: Asia/Shanghai
     ports:
-      - "${MILVUS_PORT:-19531}:19530"
+      - "${MILVUS_PORT:-19541}:19530"
       - "${MILVUS_METRICS_PORT:-9092}:9091"
     volumes:
       - ./volumes/milvus:/var/lib/milvus
