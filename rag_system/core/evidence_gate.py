@@ -11,11 +11,10 @@
 3. 只有 1 块孤证时要求 `top1 ≥ threshold + single_doc_bonus`；
 4. 问句实词在 top1 证据里的覆盖率 `< min_qcov`（挡"同主题不同知识点"）。
 
-第五条（阶段 4.2）是**多路覆盖度**：`SUB_QUERY` 计划了几路，就要求每一路都产出过证据。
-前四条全都只看 top1，而多路分解最典型的失败恰恰是"其中两路一条都没召回，第三路拿到了
-一条高分"——此时 top1 与 margin 都很漂亮，门会说 sufficient，模型拿着三分之一的信息
-答一个问了三件事的问题。这条**只在计划任务数 ≥2 时才判**：单任务时"某一路没证据"
-就是"整体没证据"，前四条已经判过。
+第五条（阶段 4.2）是**任务级证据覆盖**：`SUB_QUERY` 计划了几路，就逐路检查相关性、分数、
+跨文档歧义与问句覆盖率。不能只检查“每路是否返回过任意片段”，因为同主题的无关片段也算命中。
+只要部分任务通过，就允许基于通过任务的证据生成，并明确标记未覆盖子问题；没有任何任务通过，
+仍按不足证据处理。单任务继续使用原有证据门，不改变 DIRECT 基线。
 
 判据顺序写死（与 `reasons` 的归因顺序一致）：空结果（按过滤条件分诊）→ `below_threshold`
 → `single_weak_evidence` → `conflicting` → `ambiguous` → `low_query_coverage` →
@@ -29,6 +28,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Sequence
 
 from base.contracts import (
@@ -37,6 +37,7 @@ from base.contracts import (
     RetrievalFilters,
     RetrievalResult,
     RetryAction,
+    TaskCoverage,
 )
 from base.logger import get_logger
 
@@ -94,6 +95,31 @@ def evaluate(
     filters: RetrievalFilters | None = None,
     conflicts: Sequence[str] = (),
 ) -> EvidenceDecision:
+    # 多路任务必须分别评估。全局 top1 只代表“至少有一路很像”，不能证明每一路都可答。
+    if len(result.task_results) >= 2:
+        decision = _evaluate_multi_task(
+            result,
+            threshold=threshold,
+            margin=margin,
+            min_docs=min_docs,
+            single_doc_bonus=single_doc_bonus,
+            min_qcov=min_qcov,
+            filters=filters,
+        )
+        log.info(
+            "rag_gate",
+            status=decision.status,
+            reasons=",".join(decision.reasons),
+            action=decision.retry_action,
+            top_score=round(decision.top_score, 4),
+            margin=round(decision.margin, 4),
+            n_docs=decision.n_docs,
+            qcov=round(decision.qcov, 4),
+            coverage_rate=round(decision.coverage_rate, 4),
+            missing_tasks=decision.missing_tasks or "-",
+        )
+        return decision
+
     evidences = result.evidences
     if not evidences:
         # 有业务过滤时先怀疑"过滤太窄"，而不是"知识库没有"——两者的处置完全不同。
@@ -153,6 +179,137 @@ def evaluate(
         return _decision("insufficient", ("missing_task_evidence",), "retry_direct", result, *common)
 
     return _decision("sufficient", ("ok",), "none", result, *common, missing=())
+
+
+def _evaluate_multi_task(
+    result: RetrievalResult,
+    *,
+    threshold: float,
+    margin: float,
+    min_docs: int,
+    single_doc_bonus: float,
+    min_qcov: float,
+    filters: RetrievalFilters | None,
+) -> EvidenceDecision:
+    """先逐任务评估质量，再汇总为完整覆盖 / 部分覆盖 / 无可用覆盖。
+
+    全局结果只检查是否存在达到阈值的候选；margin、冲突与 query coverage 都在单任务内
+    计算，避免把两个不同子问题的证据误判为彼此冲突或歧义。
+    """
+    from rag_system.core import evidence_builder
+
+    # 全局只做基础可用性检查，不拿整句复合问题去和某一路 top1 算 qcov/margin。
+    global_result = replace(
+        result, query="", tasks=(), task_hits=(), task_results=()
+    )
+    base = evaluate(
+        global_result,
+        threshold=threshold,
+        margin=0.0,
+        min_docs=0,
+        single_doc_bonus=0.0,
+        min_qcov=0.0,
+        filters=filters,
+        conflicts=(),
+    )
+
+    coverage: list[TaskCoverage] = []
+    for task in result.task_results:
+        task_result = RetrievalResult(query=task.query, evidences=task.evidences)
+        task_conflicts = evidence_builder.detect_conflicts(
+            task.evidences, threshold=threshold
+        )
+        decision = evaluate(
+            task_result,
+            threshold=threshold,
+            margin=margin,
+            min_docs=min_docs,
+            single_doc_bonus=single_doc_bonus,
+            min_qcov=min_qcov,
+            filters=task.filters,
+            conflicts=task_conflicts,
+        )
+        coverage.append(
+            TaskCoverage(
+                task_id=task.task_id,
+                query=task.query,
+                status=decision.status,
+                reasons=decision.reasons,
+                evidence_count=len(task.evidences),
+                top_score=decision.top_score,
+                margin=decision.margin,
+                n_docs=decision.n_docs,
+                qcov=decision.qcov,
+                covered=decision.passed,
+                failed=task.failed,
+            )
+        )
+
+    covered = [item for item in coverage if item.covered]
+    missing = tuple(item.task_id for item in coverage if not item.covered)
+    # 多路请求的整体指标由各路真实判定汇总，不把空 query 得到的 qcov=1.0 冒充实际值。
+    metrics = {
+        "top_score": max((item.top_score for item in coverage), default=base.top_score),
+        "margin": min((item.margin for item in coverage), default=base.margin),
+        "n_docs": sum(item.n_docs for item in coverage),
+        "qcov": sum(item.qcov for item in coverage) / len(coverage) if coverage else base.qcov,
+    }
+    if base.status != "sufficient":
+        return replace(base, **metrics, missing_tasks=missing, task_coverage=tuple(coverage))
+
+    if not missing:
+        return replace(base, **metrics, task_coverage=tuple(coverage), missing_tasks=())
+
+    if covered:
+        return replace(
+            base,
+            **metrics,
+            status="partial",
+            reasons=("partial_task_coverage",),
+            missing_tasks=missing,
+            retry_action="none",
+            task_coverage=tuple(coverage),
+        )
+
+    conflict_reasons = tuple(
+        dict.fromkeys(
+            reason
+            for item in coverage
+            if item.status == "conflicting"
+            for reason in item.reasons
+        )
+    )
+    if conflict_reasons:
+        return replace(
+            base,
+            **metrics,
+            status="conflicting",
+            reasons=conflict_reasons,
+            missing_tasks=missing,
+            retry_action="return_conflict",
+            task_coverage=tuple(coverage),
+        )
+
+    if any(item.status == "ambiguous" for item in coverage):
+        return replace(
+            base,
+            **metrics,
+            status="ambiguous",
+            reasons=("task_ambiguous",),
+            missing_tasks=missing,
+            retry_action="ask_disambiguate",
+            task_coverage=tuple(coverage),
+        )
+
+    return replace(
+        base,
+        **metrics,
+        status="insufficient",
+        reasons=("no_task_sufficient_evidence",),
+        missing_tasks=missing,
+        retry_action="retry_direct",
+        task_coverage=tuple(coverage),
+    )
 
 
 def _empty_reason(filters: RetrievalFilters | None) -> str:

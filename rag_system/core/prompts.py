@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from base.contracts import FAQCandidate
+from base.contracts import FAQCandidate, TaskCoverage
 from rag_system.core.llm_gateway import Msg
 from rag_system.core.retriever import Evidence
 
@@ -147,6 +147,7 @@ def build_messages(
     memory: str = "",
     history: list[tuple[str, str]] | None = None,
     faq_candidates: Sequence[FAQCandidate] = (),
+    task_coverage: Sequence[TaskCoverage] = (),
 ) -> list[Msg]:
     """把本轮检索到的证据装进上下文。编号从 1 开始，与 citation.py 的 [n] 一一对应。
 
@@ -180,8 +181,26 @@ def build_messages(
         blocks.append(f"{head}\n{highlight(ev.text[:max_chars], ev.child_hits)}")
 
     context = "\n\n".join(blocks) if blocks else "（无）"
-    user = f"【资料】\n{context}\n\n【问题】\n{query.strip()}"
+    missing = [item for item in task_coverage if not item.covered]
+    coverage_note = ""
+    if task_coverage and missing:
+        covered = [item.query for item in task_coverage if item.covered]
+        missing_queries = [item.query for item in missing]
+        coverage_note = (
+            "\n\n【子问题证据覆盖】\n"
+            + "已覆盖：\n" + "\n".join(f"- {q}" for q in covered)
+            + "\n未覆盖：\n" + "\n".join(f"- {q}" for q in missing_queries)
+        )
+    user = f"【资料】\n{context}{coverage_note}\n\n【问题】\n{query.strip()}"
     turns: list[Msg] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if coverage_note:
+        turns.append({
+            "role": "system",
+            "content": (
+                "本轮是部分覆盖回答。只回答已覆盖子问题；未覆盖子问题必须明确说明“知识库暂无该部分资料”，"
+                "不得用常识、猜测或其他子问题的证据补齐。每个已回答结论仍须引用资料编号。"
+            ),
+        })
     turns.extend(_memory_block(memory))
     faq_block = render_faq_candidates(faq_candidates)
     if faq_block:

@@ -300,9 +300,9 @@ class Chunk:
 # 一次请求从进来到出去，只在下面这些类型之间流动。禁止再用裸 dict 传业务字段：
 # 三模块（理解/检索/生成）与编排层全靠它们对齐，字段漂移是"线上日志与行为对不上"的主因。
 
-# 证据门结论（§7.2.7-B 第 6 步）：sufficient 才能生成；其余三档各有下游动作。
+# 证据门结论（§7.2.7-B 第 6 步）：sufficient 正常生成；partial 仅基于已覆盖任务生成。
 # 注意它**不包含"重试几次"**——重试决策属于 pipeline/orchestrator，门只负责说"为什么不够"。
-GateStatus = Literal["sufficient", "insufficient", "ambiguous", "conflicting"]
+GateStatus = Literal["sufficient", "partial", "insufficient", "ambiguous", "conflicting"]
 
 # 门给出的建议动作（§7.2.7-C 的映射表的机读形态）。真正执行与否由 pipeline 决定，
 # 且**至多执行一次**：反复重试会把预算吃光，还会把"检索系统坏了"伪装成"资料里没有"。
@@ -727,6 +727,49 @@ class Evidence:
 
 
 @dataclass(slots=True)
+class TaskEvidence:
+    """单路检索的原始证据快照，在跨任务融合前保留。"""
+
+    task_id: str
+    query: str
+    filters: RetrievalFilters
+    evidences: list[Evidence] = field(default_factory=list)
+    failed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCoverage:
+    """单个子问题的证据质量判定，不以“是否有命中”代替“是否能回答”。"""
+
+    task_id: str
+    query: str
+    status: GateStatus
+    reasons: tuple[str, ...] = ()
+    evidence_count: int = 0
+    top_score: float = 0.0
+    margin: float = 0.0
+    n_docs: int = 0
+    qcov: float = 0.0
+    covered: bool = False
+    failed: bool = False
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "query": self.query,
+            "status": self.status,
+            "reasons": list(self.reasons),
+            "evidence_count": self.evidence_count,
+            "top_score": round(self.top_score, 4),
+            "margin": round(self.margin, 4),
+            "n_docs": self.n_docs,
+            "qcov": round(self.qcov, 4),
+            "covered": self.covered,
+            "failed": self.failed,
+        }
+
+
+@dataclass(slots=True)
 class RetrievalResult:
     """检索收口结果。`stages` 是**实测**的分阶段耗时（§7.2.7-D 的键名），不许填估值。"""
 
@@ -745,6 +788,8 @@ class RetrievalResult:
     # 换成单路 DIRECT（策略名与任务数在响应体里随之丢失）
     task_hits: tuple[str, ...] = ()
     stages: dict[str, int] = field(default_factory=dict)
+    # 每路任务在融合前的证据快照；task_hits 只表达“有命中”，task_results 才能评估质量。
+    task_results: tuple[TaskEvidence, ...] = ()
 
     @property
     def top_score(self) -> float:
@@ -758,7 +803,7 @@ class RetrievalResult:
 class EvidenceDecision:
     """证据门结论（§7.2.7-B 第 6 步）。
 
-    `status` 四值 + `reasons` 多值：一次检索可能同时"分数不够"且"候选太少"，
+    `status` 区分完整覆盖、部分覆盖与不可回答；`reasons` 可记录多个失败原因。
     只留一个字符串会丢掉另一半病灶（这正是旧版 `reason: str` 的问题）。
     `retry_count` 记录**已经做过几次修复**，由 pipeline 写回，门自己不改它。
     """
@@ -772,11 +817,18 @@ class EvidenceDecision:
     margin: float = 0.0
     n_docs: int = 0
     qcov: float = 0.0
+    task_coverage: tuple[TaskCoverage, ...] = ()
 
     @property
     def passed(self) -> bool:
-        """是否允许生成。派生字段：`status == "sufficient"` 是唯一口径。"""
-        return self.status == "sufficient"
+        """sufficient 正常生成；partial 只用已覆盖任务的证据生成。"""
+        return self.status in ("sufficient", "partial")
+
+    @property
+    def coverage_rate(self) -> float:
+        if not self.task_coverage:
+            return 1.0 if self.passed else 0.0
+        return sum(item.covered for item in self.task_coverage) / len(self.task_coverage)
 
     @property
     def reason(self) -> str:
@@ -806,6 +858,8 @@ class EvidenceDecision:
             "margin": round(self.margin, 4),
             "n_docs": self.n_docs,
             "qcov": round(self.qcov, 4),
+            "coverage_rate": round(self.coverage_rate, 4),
+            "task_coverage": [item.as_dict() for item in self.task_coverage],
         }
 
 

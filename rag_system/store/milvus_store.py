@@ -434,8 +434,12 @@ class ChunkStore:
             conds.append(f'kb_version == "{_escape(filters.kb_version)}"')
             if filters.acl_tags:
                 tags = ", ".join(f'"{_escape(t)}"' for t in filters.acl_tags)
-                # 无标签的公共文档对所有租户可见；有标签的必须命中其一
+                # 无标签的公共文档对所有租户可见；有标签的必须命中其一。
                 conds.append(f"(array_length(acl_tags) == 0 or array_contains_any(acl_tags, [{tags}]))")
+            else:
+                # 用户没有任何 ACL 标签时，只能读公共文档。
+                # 不能省略 ACL 条件，否则会把所有带权限标签的私有文档也召回。
+                conds.append("array_length(acl_tags) == 0")
             if len(filters.subjects) == 1:
                 conds.append(f'subject == "{_escape(filters.subjects[0])}"')
             elif len(filters.subjects) > 1:

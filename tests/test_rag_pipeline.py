@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 from base.config import Settings
-from base.contracts import Evidence, QueryContext, RetrievalFilters, RetrievalResult
+from base.contracts import Evidence, EvidenceDecision, QueryContext, RetrievalFilters, RetrievalResult
 from base.errors import RetrievalUnavailable
 from rag_system.core.planner import build_plan
 from rag_system.core.rag_pipeline import PipelineOutcome, RagPipeline
@@ -29,10 +29,11 @@ PASS_TEXT = "二次函数 y=ax²+bx+c 可通过配方法化为顶点式 y=a(x-h)
 
 def _settings(**kwargs: Any) -> Settings:
     base = dict(
-        rag_evidence_threshold=0.5,
-        rag_evidence_margin=0.03,
-        rag_evidence_min_docs=1,
-        rag_evidence_qcov=0.0,
+        # Settings 使用大写 Field alias；populate_by_name 未开启，测试也必须按 alias 传值。
+        RAG_EVIDENCE_THRESHOLD=0.5,
+        RAG_EVIDENCE_MARGIN=0.03,
+        RAG_EVIDENCE_MIN_DOCS=1,
+        RAG_EVIDENCE_QCOV=0.0,
     )
     base.update(kwargs)
     return Settings(**base)
@@ -118,6 +119,41 @@ def test_security_filters_survive_relaxation() -> None:
         assert f.tenant_id == original.tenant_id == "t1"
         assert f.acl_tags == original.acl_tags == ("acl-a",)
         assert f.kb_version == original.kb_version == "v7"
+
+
+def test_retry_original_query_is_skipped_when_original_was_already_retrieved() -> None:
+    """专门覆盖理解层失败后回退原问句的路径：原问句已检索就不再重复。"""
+    retriever = ScriptedRetriever([[]])
+
+    def force_retry_original(result, **kwargs):
+        return EvidenceDecision(
+            status="insufficient",
+            reasons=("below_threshold",),
+            retry_action="retry_original_query",
+        )
+
+    pipeline = RagPipeline(_settings(), retriever, gate=force_retry_original)
+    outcome = asyncio.run(
+        pipeline.run(QUERY, _ctx(original_query=QUERY))
+    )
+
+    assert len(retriever.calls) == 1
+    assert retriever.calls[0]["query"] == QUERY
+    assert "retry_skipped_duplicate_query" in outcome.degraded
+    assert outcome.decision.retry_action == "fallback"
+    assert outcome.decision.retry_count == 0
+
+
+def test_identical_retry_query_is_skipped_after_first_retrieval() -> None:
+    """原始 DIRECT 问句已按相同过滤与 top_k 检索，retry_direct 不应再跑一遍。"""
+    retriever = ScriptedRetriever([[]])
+    pipeline = RagPipeline(_settings(), retriever)
+
+    outcome = _run(pipeline, _ctx())
+
+    assert len(retriever.calls) == 1
+    assert "retry_skipped_duplicate_query" in outcome.degraded
+    assert outcome.decision.retry_action == "fallback"
 
 
 def test_repair_happens_at_most_once() -> None:
@@ -358,12 +394,8 @@ def test_recall_timeout_with_rerank_already_off_is_retrieval_unavailable() -> No
     assert retriever.calls == 1  # 没有第二次白跑
 
 
-def test_failed_repair_keeps_the_first_round_result() -> None:
-    """修复那次没跑完（超时），不能把第一次的结果与结论一起丢掉。
-
-    否则"多试一次失败"会把本来能答的请求降成 `retrieval_unavailable`——
-    用户看到的是"服务异常"，而这只是一次多余的尝试没打成。
-    """
+def test_duplicate_repair_query_is_skipped_without_losing_first_result() -> None:
+    """第一次已经执行相同 query/filter/top_k，不能再用同一检索签名空转。"""
 
     class EmptyThenHang:
         def __init__(self) -> None:
@@ -374,13 +406,14 @@ def test_failed_repair_keeps_the_first_round_result() -> None:
             if self.calls == 1:
                 return RetrievalResult(query=query, evidences=[], raw_hits=0, cost_ms=3)
             await asyncio.sleep(3600)
-            raise AssertionError("超时之后不该再走到这里")
+            raise AssertionError("重复检索不应进入第二次调用")
 
     retriever = EmptyThenHang()
     pipeline = RagPipeline(_settings(), retriever)
-
-    # 第一次空证据 → 门不过 → 建议修复；第二次挂住被超时打断
     outcome = asyncio.run(pipeline.run(QUERY, _ctx(), budget_ms=300))
 
-    assert outcome.decision.status != "sufficient"   # 门仍然不过，这是实话
-    assert "retry_failed" in outcome.degraded
+    assert retriever.calls == 1
+    assert outcome.decision.status != "sufficient"
+    assert "retry_skipped_duplicate_query" in outcome.degraded
+    assert "retry_failed" not in outcome.degraded
+    assert outcome.decision.retry_count == 0
