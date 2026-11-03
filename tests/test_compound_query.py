@@ -22,7 +22,13 @@ from typing import Any
 
 import pytest
 
-from understanding.compound_query import MAX_SUB_QUERIES, _verified, split, split_with_model
+from understanding.compound_query import (
+    MAX_SUB_QUERIES,
+    _verified,
+    looks_compound,
+    split,
+    split_with_model,
+)
 
 # 规格里的原例（任务 2.4）。它的三个子问题是整个模块的黄金样本：
 # 一路"区别" + 两路"各出一份练习题"，正是"两件不相干的事各自有自己的召回"。
@@ -262,3 +268,114 @@ def test_model_saying_not_compound_does_not_erase_the_rule_split() -> None:
     assert result.sub_queries == SPEC_SUBS
     assert result.degraded == ()
 
+def test_single_comparison_question_never_calls_model() -> None:
+    """单纯比较两个知识点仍然只有一个诉求，不应该调用模型。"""
+    llm = _StubLLM(text='{"sub_queries": []}')
+
+    query = "比较一次函数和二次函数的区别"
+
+    assert looks_compound(query) is False
+
+    result = _split_with_model(query, llm)
+
+    assert llm.calls == []
+    assert result.is_complex is False
+    assert result.sub_queries == ()
+    assert result.degraded == ()
+
+
+def test_single_value_question_with_and_never_calls_model() -> None:
+    """出现“和”不代表一定有两个诉求。"""
+    llm = _StubLLM(text='{"sub_queries": []}')
+
+    query = "求一次函数和二次函数的值"
+
+    result = _split_with_model(query, llm)
+
+    assert llm.calls == []
+    assert result.is_complex is False
+
+
+def test_two_independent_clauses_can_call_model() -> None:
+    """两个独立诉求不能被预筛误杀。"""
+    llm = _StubLLM(
+        text=json.dumps(
+            {
+                "sub_queries": [
+                    "二次函数的顶点式怎么求",
+                    "它的对称轴是什么",
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    query = "二次函数的顶点式怎么求，还有它的对称轴是什么"
+
+    result = _split_with_model(query, llm)
+
+    assert len(llm.calls) == 1
+    assert result.source == "model"
+    assert result.is_complex is True
+    assert len(result.sub_queries) == 2
+
+
+def test_model_returns_one_valid_candidate_marks_rejected() -> None:
+    """模型只给一条有效子问题，不能当成成功拆分。"""
+    llm = _StubLLM(
+        text=json.dumps(
+            {"sub_queries": ["一次函数和二次函数的区别"]},
+            ensure_ascii=False,
+        )
+    )
+
+    result = _split_with_model(SPEC, llm)
+
+    assert result.source == "distribute"
+    assert result.sub_queries == SPEC_SUBS
+    assert result.degraded == ("compound_rejected",)
+
+
+def test_model_returns_invalid_candidate_type_marks_bad_json() -> None:
+    """JSON 能解析不代表结构正确，非字符串候选应该判为坏 JSON。"""
+    llm = _StubLLM(
+        text=json.dumps(
+            {
+                "sub_queries": [
+                    "一次函数和二次函数的区别",
+                    123,
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    result = _split_with_model(SPEC, llm)
+
+    assert result.source == "distribute"
+    assert result.sub_queries == SPEC_SUBS
+    assert result.degraded == ("compound_bad_json",)
+
+
+def test_zero_budget_does_not_call_model() -> None:
+    """预算耗尽时直接规则回退，不发送模型请求。"""
+    llm = _StubLLM(
+        text=json.dumps(
+            {"sub_queries": list(SPEC_SUBS)},
+            ensure_ascii=False,
+        )
+    )
+
+    result = asyncio.run(
+        split_with_model(
+            SPEC,
+            llm,
+            budget_ms=0,
+            model="stub-model",
+        )
+    )
+
+    assert llm.calls == []
+    assert result.source == "distribute"
+    assert result.sub_queries == SPEC_SUBS
+    assert result.degraded == ("compound_timeout",)

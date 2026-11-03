@@ -149,20 +149,53 @@ _SPLIT_SYSTEM = (
 
 
 def looks_compound(text: str) -> bool:
-    """结构预筛：这句话**可能**有多个诉求吗？只看形状，不看语义、不调模型。
+    """结构预筛：判断是否值得调用本地模型。
 
-    判宽一点是刻意的，两边代价不对称：漏判 = 复合句被当单句查，用户拿不到第二件事的
-    证据（用户可见的损失）；多判 = 多付一次**本地**模型调用（不计费、不出网，几十毫秒）。
-    所以这里宁可放过，也不要把"求 x 和 y 的值"这种单诉求句漏在门外。
+    目标不是判断所有语义上的复合句，而是先挡住明显的单诉求句，
+    避免每个带有“和、与、区别”的普通问题都调用一次 Ollama。
+
+    允许进入模型的情况：
+    1. 明确的分发诉求：分别、各自；
+    2. 至少两个具有独立诉求特征的分句；
+    3. 无标点并列结构，且规则能够识别出至少两个独立诉求。
+
+    例如：
+    - “比较一次函数和二次函数的区别” -> False
+    - “求一次函数的值，还有二次函数的顶点式怎么求” -> True
+    - “比较一次函数和二次函数的区别，并分别出三道题” -> True
+    - “一次函数怎么求和二次函数有什么区别” -> True
     """
     text = (text or "").strip()
+
     if len(text) < _MIN_SUB_LEN:
         return False
-    if _DISTRIBUTE.search(text) or _DIFF.search(text) or _CONJUNCTION.search(text):
+
+    # ① 明确的分发标记：例如“分别出题”“各自介绍”
+    if _DISTRIBUTE.search(text):
         return True
-    # 够长的分句 ≥2 个才值得拆：「老师，X 怎么求」里"老师"只有两个字段，不算第二件事
-    clauses = [c for c in _CLAUSE.split(text) if len(c.strip()) >= _MIN_SUB_LEN]
-    return len(clauses) >= 2
+
+    # ② 标点或连接词分句后，至少有两个独立诉求
+    clauses = [
+        clause.strip()
+        for clause in _CLAUSE.split(text)
+        if len(clause.strip()) >= _MIN_SUB_LEN
+    ]
+
+    actionable_clauses = [
+        clause for clause in clauses
+        if _CUE.search(clause)
+    ]
+
+    if len(actionable_clauses) >= 2:
+        return True
+
+    # ③ 无标点并列诉求。
+    # _by_conjunction 内部已经排除了：
+    # “比较A和B的区别”这类单一对比诉求。
+    if _by_conjunction(text):
+        return True
+
+    return False
 
 
 async def split_with_model(
@@ -172,59 +205,95 @@ async def split_with_model(
     budget_ms: int,
     model: str | None = None,
 ) -> CompoundResult:
-    """本地小模型优先拆句，**任何失败都退回规则** `split()`。**永不抛异常。**
+    """本地模型优先拆分，任何异常都退回规则 split()。
 
-    三道闸按顺序：
+    失败码：
+    - compound_timeout：模型调用超时，或调用预算已经耗尽
+    - compound_failed：模型网关调用异常
+    - compound_bad_json：模型输出不是合法 JSON，或结构不符合约定
+    - compound_rejected：模型提供了候选，但有效子问题不足两个，或候选未通过来源校验
 
-    1. `looks_compound()` 结构预筛——单诉求句（占绝大多数）根本不该为它付一次模型调用；
-    2. 模型调用包 `wait_for`，到点即放弃（拆句不值得拖住首 token）；
-    3. 模型给的每一条都过 `_verified()`，编出来的词当场丢弃。
-
-    **契约**：`degraded` 非空 ⟺ 这次没拆成模型的样子，`source` 是规则给的；
-    `source == "model"` 且 `degraded` 为空才是模型拆的。两种"没拆"要分清：模型明确
-    回了空列表 = 它认为不是复合句（不记降级，但仍退回规则当垫底，见模块文档），
-    它给了候选却全被来源校验挡掉 = `compound_rejected`（那是它在编词）。
-
-    没有可用的本地模型时**直接返回规则结果且不记降级**：没配 Ollama 是部署形态，
-    不是这次请求出了岔子。
+    特殊情况：
+    - 单诉求句：预筛直接返回，不调用模型
+    - 没有配置本地模型：使用规则，不记 degraded
+    - 模型明确返回空列表：使用规则，不记 degraded
+    - 模型编造词语：拒绝模型结果，使用规则并记 compound_rejected
     """
     text = (query or "").strip()
+
+    # ① 结构预筛：单诉求句不调用本地模型
     if not looks_compound(text):
         return CompoundResult()
+
+    # ② 没有配置本地模型属于部署形态，不算运行故障
     if llm is None or not getattr(llm, "enabled", False):
         return split(text)
 
+    # ③ 请求预算耗尽，不再发起无意义的模型请求
+    if budget_ms <= 0:
+        return _fallback(text, "compound_timeout")
+
     try:
         result = await asyncio.wait_for(
-            llm.complete(_split_messages(text), budget_ms=budget_ms, model=model),
-            timeout=max(budget_ms, 1) / 1000.0,
+            llm.complete(
+                _split_messages(text),
+                budget_ms=budget_ms,
+                model=model,
+            ),
+            timeout=budget_ms / 1000.0,
         )
+
     except asyncio.TimeoutError:
         return _fallback(text, "compound_timeout")
-    except Exception:  # noqa: BLE001 — 网关卡了不关本模块的事，规则照跑
+
+    except Exception:  # noqa: BLE001
+        # 本地模型不可用不能影响主 RAG 链路
         return _fallback(text, "compound_failed")
 
+    # ④ 提取模型文本
     payload = getattr(result, "text", None)
-    data = _json_object(payload if isinstance(payload, str) else "")
+
+    if not isinstance(payload, str) or not payload.strip():
+        return _fallback(text, "compound_bad_json")
+
+    data = _json_object(payload)
+
     if data is None:
         return _fallback(text, "compound_bad_json")
 
+    # ⑤ 校验 JSON 结构
     candidates = data.get("sub_queries")
+
     if not isinstance(candidates, list):
         return _fallback(text, "compound_bad_json")
-    kept, dropped = _verified(text, [c for c in candidates if isinstance(c, str)])
+
+    # 不允许静默丢弃非字符串数据。
+    # 例如 ["一次函数怎么求", 123] 属于模型输出结构异常。
+    if any(not isinstance(candidate, str) for candidate in candidates):
+        return _fallback(text, "compound_bad_json")
+
+    # ⑥ 模型明确表示没有复合诉求
+    # 不能让模型的空列表覆盖规则已经拆对的结果。
+    # 这是模型的正常判断，不记降级。
+    if not candidates:
+        return _fallback(text, "")
+
+    # ⑦ 字符多重集来源校验
+    kept, dropped = _verified(text, candidates)
+
+    # ⑧ 模型给了候选，但最终不足两个有效子问题
+    # 无论是全部编造、只有一个有效候选，还是重复候选，
+    # 都不能把它当成一次成功的模型拆分。
     if len(kept) < 2:
-        # 模型说"不是复合句"可以信，但**不能让规则已经拆对的路跟着没了**：
-        # 0.8b 偶尔把三诉求句当一件事，退回规则比听它否掉安全。两者都拆不出来时，
-        # 下面 `split()` 也是 `CompoundResult()`，行为等价
-        return _fallback(text, "compound_rejected" if dropped else "")
+        return _fallback(text, "compound_rejected")
+
+    # ⑨ 模型拆分成功
     return CompoundResult(
         is_complex=True,
         sub_queries=tuple(kept[:MAX_SUB_QUERIES]),
         source="model",
         dropped=tuple(dropped),
     )
-
 
 def _fallback(text: str, code: str) -> CompoundResult:
     """回落到规则结果，并把"模型那条路为什么没成"挂上去（`code` 为空表示不是失败）。"""

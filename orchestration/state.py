@@ -52,6 +52,7 @@ _DEGRADED_ANSWER = frozenset(
         "citation_unsupported",
         "rerank_failed",
         "partial_recall_failed",
+        "partial_task_coverage",
         "doc_type_relaxed",
         "faq_unavailable",
         "intent_unavailable",

@@ -528,6 +528,8 @@ class ChatPipeline:
         state.degraded.extend(outcome.result.degraded)
 
         decision = outcome.decision
+        if decision.status == "partial":
+            state.degraded.append("partial_task_coverage")
         if not decision.passed:
             state.degraded.append(f"gate_{decision.reason}")
             if faq.tier == "mid" and suggestion:
@@ -568,6 +570,7 @@ class ChatPipeline:
             memory=_memory_text(state),
             history=state.history,
             faq_candidates=_faq_prompt_candidates(state, self.settings),
+            task_coverage=state.gate.task_coverage if state.gate else (),
         )
         t0 = time.perf_counter()
         gateway = self._llm_for(state)
@@ -654,6 +657,7 @@ class ChatPipeline:
             memory=_memory_text(state),
             history=state.history,
             faq_candidates=_faq_prompt_candidates(state, self.settings),
+            task_coverage=state.gate.task_coverage if state.gate else (),
         )
 
         buffer = ""

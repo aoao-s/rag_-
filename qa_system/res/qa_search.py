@@ -289,7 +289,12 @@ class FAQService:
     async def warmup(self, samples: list[str] | None = None) -> int:
         """预热：跑一遍真实查询，让 jieba 词典与分词缓存进入热态，并重置预热期的指标。"""
         self._snapshot.normalizer.preload()
-        queries = samples or ["学费多少", "课程学多久", "怎么报名"]
+        queries = samples or [
+            "什么是有理数",
+            "二次函数是什么?怎么学?有什么技巧吗",
+            "都是些什么,我不太懂",
+            "上次说的二次函数还记得吗",
+        ]
         for query in queries:
             await self.search(query)
         self._stats = _Stats(rebuilds=self._stats.rebuilds)

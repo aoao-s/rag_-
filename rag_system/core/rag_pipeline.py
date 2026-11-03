@@ -39,6 +39,7 @@ from base.contracts import (
     RetrievalPlan,
     RetrievalResult,
     Strategy,
+    TaskEvidence,
 )
 from base.errors import RetrievalUnavailable
 from base.logger import get_logger
@@ -221,6 +222,12 @@ class RagPipeline:
         if plan.strategy == Strategy.HYDE:
             plan, hyde_text = await self._apply_hyde(plan, stages, degraded)
 
+        # 同一请求内记录已经真正发起过的检索签名。相同 query + filters + top_k
+        # 不重复执行；但放宽业务过滤或扩大邻域会改变检索条件，仍允许作为有效修复。
+        executed_signatures: set[tuple[str, RetrievalFilters, int]] = set()
+        plan = _dedupe_plan_tasks(plan, executed_signatures)
+        executed_signatures.update(_task_signature(task) for task in plan.tasks)
+
         # 给的是**剩余预算**（不是总预算）：修复前后的两次召回共用同一个 8 s，
         # 各给一份总额会让"至多修复一次"变成"至多跑两倍预算"
         outcome = await self._execute(
@@ -234,6 +241,7 @@ class RagPipeline:
             outcome.result, plan, stages, original_query=ctx.original_query
         )
         outcome.decision = decision
+        self._apply_task_coverage(outcome.result, decision, plan)
 
         repairs = 0
         while not decision.passed and repairs < self.max_repairs:
@@ -244,8 +252,23 @@ class RagPipeline:
                 degraded.append("budget_exceeded")
                 log.warning("rag_repair_skipped", reason="budget", action=decision.retry_action)
                 break
-            repairs += 1
             plan2, note = repair
+            plan2 = _dedupe_plan_tasks(plan2, executed_signatures)
+            if not plan2.tasks:
+                # Query Understanding 超时后常见的无效路径：原始问句已经按同一组
+                # filters/top_k 检索过，再用完全相同的检索条件跑一次不会带来新信息。
+                degraded.append("retry_skipped_duplicate_query")
+                retry_action = decision.retry_action
+                decision = decision.with_retry("fallback", count=repairs)
+                outcome.decision = decision
+                log.info(
+                    "rag_repair_skipped",
+                    reason="duplicate_query_signature",
+                    action=retry_action,
+                )
+                break
+            repairs += 1
+            executed_signatures.update(_task_signature(task) for task in plan2.tasks)
             degraded.append(f"retry:{note}")
             log.info("rag_repair", action=decision.retry_action, note=note, attempt=repairs)
             retry_started = time.perf_counter()
@@ -284,6 +307,7 @@ class RagPipeline:
                 decision.retry_action, count=repairs
             )
             outcome.decision = decision
+            self._apply_task_coverage(outcome.result, decision, plan2)
             stages["retry"] = _ms(retry_started)
 
         if not decision.passed and repairs and repairs >= self.max_repairs:
@@ -442,12 +466,36 @@ class RagPipeline:
         # 会因此看起来"一条证据都没有"，进而触发一次多余的 `retry_direct`，
         # 把 SUB_QUERY 计划换成单路 DIRECT（响应体里的 `strategy` 与任务数随之丢失）
         hits: list[str] = []
+        task_results: list[TaskEvidence] = []
         for task, res in zip(plan.tasks, results):
             if isinstance(res, BaseException):
                 errors.append(res)
+                task_results.append(
+                    TaskEvidence(
+                        task_id=task.task_id,
+                        query=task.query,
+                        filters=task.filters,
+                        evidences=[],
+                        failed=True,
+                    )
+                )
                 continue
             ok.append(res)
-            if res.evidences:
+            # 复制证据对象：后续 fuse/build 会原地调整 score 与 child_hits，不能污染任务快照。
+            task_evidences = [
+                replace(ev, task_id=task.task_id, child_hits=list(ev.child_hits))
+                for ev in res.evidences
+            ]
+            task_results.append(
+                TaskEvidence(
+                    task_id=task.task_id,
+                    query=task.query,
+                    filters=task.filters,
+                    evidences=task_evidences,
+                    failed=False,
+                )
+            )
+            if task_evidences:
                 hits.append(task.task_id)
         if not ok and errors:
             # 全部失败才算"检索不可用"；部分失败按部分结果继续（降级而不是整体失败）
@@ -474,6 +522,7 @@ class RagPipeline:
             strategy=plan.strategy,
             tasks=tuple(t.task_id for t in plan.tasks),
             task_hits=tuple(hits),
+            task_results=tuple(task_results),
         )
         stages["recall"] = merged.cost_ms
         # 分阶段耗时从各路结果里聚合，**并行任务取最大值而不是相加**——
@@ -487,13 +536,42 @@ class RagPipeline:
                 stages[key] = max(stages.get(key, 0), value)
         return PipelineOutcome(result=merged, decision=EvidenceDecision(), attempts=1)
 
+    @staticmethod
+    def _apply_task_coverage(
+        result: RetrievalResult, decision: EvidenceDecision, plan: RetrievalPlan
+    ) -> None:
+        """部分覆盖时，只保留通过任务级证据门的资料供生成与引用。"""
+        if decision.status != "partial" or not result.task_results:
+            return
+        covered_ids = {
+            item.task_id for item in decision.task_coverage if item.covered
+        }
+        covered_results = [
+            RetrievalResult(
+                query=task.query,
+                evidences=[
+                    replace(ev, child_hits=list(ev.child_hits))
+                    for ev in task.evidences
+                ],
+            )
+            for task in result.task_results
+            if task.task_id in covered_ids
+        ]
+        result.evidences = evidence_builder.build(
+            covered_results, final_n=plan.final_n
+        )
+
     def _evaluate(
         self, result: RetrievalResult, plan: RetrievalPlan, *, original_query: str = ""
     ) -> EvidenceDecision:
         s = self.settings
         filters: RetrievalFilters | None = plan.tasks[0].filters if plan.tasks else None
-        conflicts = evidence_builder.detect_conflicts(
-            result.evidences, threshold=s.rag_evidence_threshold
+        # 多路计划的冲突必须在单任务内部判断；不同子问题的不同数值不构成冲突。
+        conflicts = (
+            () if len(result.task_results) >= 2 else
+            evidence_builder.detect_conflicts(
+                result.evidences, threshold=s.rag_evidence_threshold
+            )
         )
         return self._gate(
             # 覆盖率的分母必须是**用户原话**：τ=0.74 / qcov=0.20 是在原问句上标定的。
@@ -560,6 +638,36 @@ class RagPipeline:
                 "relax_business_filter",
             )
         return None
+
+
+def _query_key(query: str) -> str:
+    """只规范化空白与 Unicode 兼容字符，不做语义改写。"""
+    import unicodedata
+
+    return " ".join(unicodedata.normalize("NFKC", query or "").split()).casefold()
+
+
+def _task_signature(task: QueryTask) -> tuple[str, RetrievalFilters, int]:
+    """检索等价签名。策略标签不参与：它不改变实际 query/filter/top_k。"""
+    return (_query_key(task.query), task.filters, task.top_k)
+
+
+def _dedupe_plan_tasks(
+    plan: RetrievalPlan,
+    executed: set[tuple[str, RetrievalFilters, int]],
+) -> RetrievalPlan:
+    """删除本轮已执行或计划内重复的检索任务，保留首个 task_id 与原顺序。"""
+    kept: list[QueryTask] = []
+    seen = set(executed)
+    for task in plan.tasks:
+        signature = _task_signature(task)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        kept.append(task)
+    if len(kept) == len(plan.tasks):
+        return plan
+    return replace(plan, tasks=tuple(kept))
 
 
 def _single(

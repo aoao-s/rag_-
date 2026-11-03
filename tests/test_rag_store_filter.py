@@ -16,12 +16,43 @@
 from __future__ import annotations
 
 from typing import Any
+import sys
+from types import SimpleNamespace
+
+import pytest
 
 from base.config import Settings
 from base.contracts import RetrievalFilters
 from rag_system.store.milvus_store import DOC_TYPE_PARTITIONS, ChunkStore
 
 SUBJECT_EXPR = 'subject == "地理"'
+
+
+class _FakeAnnSearchRequest:
+    def __init__(self, *, data, anns_field, param, limit, expr=None):
+        self.data = data
+        self.anns_field = anns_field
+        self.param = param
+        self.limit = limit
+        self.expr = expr
+
+
+class _FakeWeightedRanker:
+    def __init__(self, *weights):
+        self.weights = weights
+
+
+@pytest.fixture(autouse=True)
+def _stub_pymilvus(monkeypatch):
+    """请求构造测试不依赖本机是否安装 pymilvus，也不连接真实 Milvus。"""
+    monkeypatch.setitem(
+        sys.modules,
+        "pymilvus",
+        SimpleNamespace(
+            AnnSearchRequest=_FakeAnnSearchRequest,
+            WeightedRanker=_FakeWeightedRanker,
+        ),
+    )
 
 
 class _FakeClient:
@@ -189,3 +220,45 @@ def test_filters_win_over_legacy_kwargs() -> None:
     expr = _exprs(call)[0] or ""
     assert SUBJECT_EXPR in expr
     assert 'subject == "历史"' not in expr
+
+
+def test_all_dense_sparse_security_and_business_filters_are_identical() -> None:
+    """Dense/Sparse 两路都必须带齐 Tenant、ACL、KB Version 与业务过滤。"""
+    store, client = _store()
+    filters = _filters(
+        subjects=("地理", "历史"),
+        doc_types=("textbook", "lesson_plan"),
+        stages=("初中",),
+        grades=("八年级", "九年级"),
+    )
+
+    store.search([0.1], {1: 0.5}, filters=filters)
+
+    (call,) = client.calls
+    dense_expr, sparse_expr = _exprs(call)
+    assert dense_expr == sparse_expr
+    assert dense_expr is not None
+    for expected in (
+        'tenant_id == "t1"',
+        'kb_version == "v1"',
+        "array_contains_any",
+        'subject in ["地理", "历史"]',
+        'doc_type in ["textbook", "lesson_plan"]',
+        'stage == "初中"',
+        'grade in ["八年级", "九年级"]',
+    ):
+        assert expected in dense_expr
+
+
+def test_empty_acl_tags_only_retrieve_public_documents() -> None:
+    """用户没有 ACL 标签时，只允许无标签公共资料，不能省略 ACL 过滤。"""
+    store, client = _store()
+
+    store.search([0.1], {1: 0.5}, filters=_filters(acl_tags=()))
+
+    (call,) = client.calls
+    exprs = _exprs(call)
+    assert len(exprs) == 2
+    assert exprs[0] == exprs[1]
+    assert "array_length(acl_tags) == 0" in (exprs[0] or "")
+    assert "array_contains_any" not in (exprs[0] or "")
