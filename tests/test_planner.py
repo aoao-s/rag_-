@@ -41,6 +41,33 @@ def test_referential_and_multi_detectors() -> None:
     assert not looks_multi("二次函数的顶点式怎么求")
 
 
+def test_planner_uses_the_shared_reference_detector() -> None:
+    assert looks_referential("它的公式是什么")
+    assert not looks_referential("那些物质能产生蓝色沉淀？")
+    assert not looks_referential("哪些物质能产生蓝色沉淀？")
+
+
+def test_stale_unresolved_flag_cannot_block_a_non_referential_query() -> None:
+    """旧词表留下的 unresolved 标记不能让完整问句跳过检索。"""
+    plan = build_plan(
+        "化学里面能产生蓝色沉淀的都有那些？",
+        _ctx(),
+        unresolved_reference=True,
+    )
+    assert plan.decision == "retrieve"
+    assert plan.strategy is Strategy.DIRECT
+    assert len(plan.tasks) == 1
+
+
+def test_unresolved_true_pronoun_still_clarifies_without_context() -> None:
+    """安全边界：真正依赖上文的「它」不能被证据门替代指代消解。"""
+    plan = build_plan(
+        "它是什么？", _ctx(), unresolved_reference=True
+    )
+    assert plan.decision == "clarify"
+    assert plan.strategy is Strategy.BACKTRACK
+
+
 # ---- 四条策略 ----
 def test_default_is_direct() -> None:
     plan = build_plan("二次函数的顶点式怎么求", _ctx())

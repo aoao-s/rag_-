@@ -296,9 +296,8 @@ class Settings(BaseSettings):
     # 前者挡的是"把 200 MB 的 body 读进内存再校验"——那一步做完就已经被打了。
     # 只按 Content-Length 判，宁可漏拦也不留半截 body 在内存里。
     max_request_bytes: int = Field(default=65536, alias="MAX_REQUEST_BYTES")
-    # JWT（HS256）验签密钥。**空 = 不启用 JWT**：此时只有白名单环境才认 `X-User-Id`
-    # 一类的开发期请求头，生产环境一律匿名。空值**不是**"随便签一个"的邀请，
-    # 生产漏配的表现是"所有请求都成了 ANONYMOUS"，而不是"所有人都能冒充"
+    # JWT（HS256）验签密钥。强制登录模式下必须配置随机强密钥（建议至少 32 字节）；
+    # 为空时认证业务接口返回 503，不能退化成匿名业务访问或信任 X-User-Id。
     jwt_secret: str = Field(default="", alias="JWT_SECRET")
     # 签发时用的过期时长。**认证服务自己不用它**（改用下面 `AUTH_*_TTL_S`，
     # 单位是秒、access 与 refresh 分开），保留是因为 tools/网关注入的令牌仍按它算。
@@ -589,12 +588,11 @@ class Settings(BaseSettings):
                 "FEATURE_HYDE 已开启但 LLM_API_KEY 为空：HyDE 生成不出来，"
                 "planner 会如实降级为 DIRECT + hyde_unavailable"
             )
-        # 生产没配 JWT_SECRET 不阻断（匿名问答是合法降级），但必须大声说出来：
-        # 此时 `X-User-Id` 一律不认，所有请求都是 ANONYMOUS——记不住会话、也不挂记忆
-        if not self.jwt_secret.strip() and not is_trusted_env(self):
+        # 强制登录：没配密钥时业务 API 会返回 503，必须在启动日志中明确提示。
+        if not self.jwt_secret.strip():
             warnings.append(
-                f"APP_ENV={self.app_env} 下 JWT_SECRET 为空：所有请求将按 ANONYMOUS 处理"
-                "（不认任何请求头身份，会话与记忆都不会落库）"
+                "JWT_SECRET 为空：强制登录已启用，所有业务 API 将返回 503 auth_not_configured；"
+                "请设置至少 32 字节的随机密钥后重启"
             )
         return warnings
 

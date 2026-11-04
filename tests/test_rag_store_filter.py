@@ -48,10 +48,7 @@ def _stub_pymilvus(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "pymilvus",
-        SimpleNamespace(
-            AnnSearchRequest=_FakeAnnSearchRequest,
-            WeightedRanker=_FakeWeightedRanker,
-        ),
+        SimpleNamespace(AnnSearchRequest=_FakeAnnSearchRequest, WeightedRanker=_FakeWeightedRanker),
     )
 
 
@@ -62,8 +59,16 @@ class _FakeClient:
         self.calls: list[dict[str, Any]] = []
 
     def hybrid_search(self, **kwargs: Any) -> list[list[Any]]:
-        self.calls.append(kwargs)
+        self.calls.append({"kind": "hybrid", **kwargs})
         return [[]]  # 没有命中，本文件只关心请求形状
+
+    def upsert(self, **kwargs: Any) -> dict[str, int]:
+        self.calls.append({"kind": "upsert", **kwargs})
+        return {"upsert_count": len(kwargs.get("data", []))}
+
+    def delete(self, **kwargs: Any) -> dict[str, int]:
+        self.calls.append({"kind": "delete", **kwargs})
+        return {"delete_count": 1}
 
 
 def _store() -> tuple[ChunkStore, _FakeClient]:
@@ -222,32 +227,52 @@ def test_filters_win_over_legacy_kwargs() -> None:
     assert 'subject == "历史"' not in expr
 
 
-def test_all_dense_sparse_security_and_business_filters_are_identical() -> None:
-    """Dense/Sparse 两路都必须带齐 Tenant、ACL、KB Version 与业务过滤。"""
+def test_upsert_requires_explicit_tenant_and_kb_version() -> None:
+    store, _ = _store()
+    with pytest.raises(TypeError):
+        store.upsert([], [], [], source="x", subject=None, doc_type="textbook", title="x", embedder="fake")
+
+
+def test_upsert_namespaces_primary_ids_by_tenant_and_version() -> None:
+    from types import SimpleNamespace
+
     store, client = _store()
-    filters = _filters(
-        subjects=("地理", "历史"),
-        doc_types=("textbook", "lesson_plan"),
-        stages=("初中",),
-        grades=("八年级", "九年级"),
+    chunk = SimpleNamespace(
+        chunk_id="doc:p0:c0",
+        doc_id="doc",
+        parent_id="doc:p0",
+        text="正文",
+        parent_text="父块正文",
+        heading="标题",
+        index=0,
+        meta={},
     )
+    common = dict(
+        chunks=[chunk], dense=[[0.0] * 4], sparse=[{1: 0.5}],
+        source="F:/shared/数学.pdf", subject="数学", doc_type="textbook",
+        title="数学", embedder="fake", kb_version="v1", acl_tags=("teacher",),
+    )
+    store.upsert(**common, tenant_id="school_a")
+    store.upsert(**common, tenant_id="school_b")
 
-    store.search([0.1], {1: 0.5}, filters=filters)
+    first, second = [call for call in client.calls if call.get("kind") == "upsert"]
+    row_a = first["data"][0]
+    row_b = second["data"][0]
+    assert row_a["tenant_id"] == "school_a"
+    assert row_b["tenant_id"] == "school_b"
+    assert row_a["acl_tags"] == ["teacher"]
+    assert row_a["chunk_id"] != row_b["chunk_id"]
+    assert row_a["doc_id"] != row_b["doc_id"]
 
-    (call,) = client.calls
-    dense_expr, sparse_expr = _exprs(call)
-    assert dense_expr == sparse_expr
-    assert dense_expr is not None
-    for expected in (
-        'tenant_id == "t1"',
-        'kb_version == "v1"',
-        "array_contains_any",
-        'subject in ["地理", "历史"]',
-        'doc_type in ["textbook", "lesson_plan"]',
-        'stage == "初中"',
-        'grade in ["八年级", "九年级"]',
-    ):
-        assert expected in dense_expr
+
+def test_delete_by_source_is_scoped_to_tenant_and_kb_version() -> None:
+    store, client = _store()
+    store.delete_by_source("F:/shared/数学.pdf", tenant_id="school_a", kb_version="v2")
+    call = client.calls[-1]
+    assert call["kind"] == "delete"
+    assert 'source == "F:/shared/数学.pdf"' in call["filter"]
+    assert 'tenant_id == "school_a"' in call["filter"]
+    assert 'kb_version == "v2"' in call["filter"]
 
 
 def test_empty_acl_tags_only_retrieve_public_documents() -> None:

@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from fastapi import FastAPI, Request, Response
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from auth.api import router as auth_router
@@ -432,9 +433,9 @@ class Container:
     def build_auth(self) -> None:
         """账号与令牌（`/api/v1/auth/*`）。仓储选择与 `build_memory()` 同一条规则。
 
-        **`JWT_SECRET` 为空不阻断启动**：四个写接口会回 503 `auth_not_configured`，
-        其它端点（FAQ / RAG / chat）照常。理由与 `LLM_API_KEY` 为空时不退出一样——
-        一台没配密钥的开发机不该连问问题都起不来。但原因必须出现在启动日志里。
+        `JWT_SECRET` 为空不阻断进程启动，但所有业务 API 会被强制认证中间件拒绝并返回
+        503 `auth_not_configured`。这样开发者仍可访问健康检查与文档，但不会出现“没配密钥
+        却悄悄按匿名身份访问业务数据”的状态。
         """
         s = self.settings
         users: UserRepo
@@ -603,6 +604,54 @@ app.include_router(memory_router)
 app.include_router(auth_router)
 
 
+def custom_openapi() -> dict[str, Any]:
+    """在 Swagger/OpenAPI 中声明 Bearer JWT，并给所有受保护 API 标记 security。
+
+    认证中间件负责真正的运行时校验；这里负责让 Swagger UI 知道如何携带 Token。
+    两者缺一不可：只有中间件时接口会返回 401，但 Swagger 页面不会出现 Authorize。
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    components = schema.setdefault("components", {})
+    schemes = components.setdefault("securitySchemes", {})
+    schemes["BearerAuth"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "先调用 POST /api/v1/auth/login，复制响应 data.access_token，再点击 Authorize 粘贴 Token。只粘贴 Token 本身，不要手动添加 Bearer 前缀。",
+    }
+
+    public_auth_paths = {
+        "/api/v1/auth/register",
+        "/api/v1/auth/login",
+        "/api/v1/auth/refresh",
+        "/api/v1/auth/logout",
+    }
+    http_methods = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
+    for path, path_item in schema.get("paths", {}).items():
+        is_api = path.startswith("/v1/") or path.startswith("/api/v1/")
+        is_public_auth = path.rstrip("/") in public_auth_paths
+        if not is_api or is_public_auth:
+            continue
+        for method, operation in path_item.items():
+            if method.lower() in http_methods and isinstance(operation, dict):
+                operation["security"] = [{"BearerAuth": []}]
+
+    app.openapi_schema = schema
+    return schema
+
+
+# Swagger 顶部显示 Authorize，受保护接口显示锁图标。
+app.openapi = custom_openapi
+
+
 @app.middleware("http")
 async def trace_middleware(request: Request, call_next: Any) -> Response:
     """给每个请求绑定 request_id，异常统一转 500 并保留 trace 便于排查。"""
@@ -617,7 +666,69 @@ async def trace_middleware(request: Request, call_next: Any) -> Response:
     # 用户拿到的是 uvicorn 的纯文本错误页，`request_id` 也没了。
     response: Response
     try:
-        response = await call_next(request)
+        # 强制登录：除认证入口与运维/文档端点外，所有 API 都必须携带有效 access token。
+        # 不再把“匿名可问答”或开发期 X-User-Id 当成正式业务身份。
+        path = request.url.path.rstrip("/") or "/"
+        public_auth_paths = {
+            "/api/v1/auth/register",
+            "/api/v1/auth/login",
+            "/api/v1/auth/refresh",
+            "/api/v1/auth/logout",
+        }
+        public_paths = {
+            "/healthz", "/readyz", "/metrics", "/docs", "/redoc", "/openapi.json"
+        }
+        is_api = path.startswith("/v1/") or path.startswith("/api/v1/")
+        if is_api and request.method != "OPTIONS" and path not in public_auth_paths and path not in public_paths:
+            auth_service = getattr(request.app.state, "auth", None)
+            if auth_service is None or not auth_service.configured:
+                response = JSONResponse(
+                    status_code=503,
+                    content={"code": 503, "message": "认证服务未配置", "data": {"error": "auth_not_configured"}},
+                )
+            else:
+                raw = (request.headers.get("authorization") or "").strip()
+                scheme, _, access_token = raw.partition(" ")
+                if scheme.lower() != "bearer" or not access_token.strip():
+                    response = JSONResponse(
+                        status_code=401,
+                        headers={"WWW-Authenticate": "Bearer"},
+                        content={"code": 401, "message": "请先登录", "data": {"error": "authentication_required"}},
+                    )
+                else:
+                    try:
+                        # me() 会验签、校验 access 类型，并从用户表读取最新角色/租户/ACL，
+                        # 同时检查账户是否停用。这样“改库禁用账户”无需等 token 自然过期。
+                        user = await auth_service.me(access_token.strip())
+                        request.state.user_id = user.user_id
+                        request.state.role = user.role
+                        request.state.tenant_id = user.tenant_id
+                        request.state.acl_tags = tuple(user.acl_tags)
+                        request.state.edurag_identity = {
+                            "user_id": user.user_id,
+                            "role": user.role,
+                            "tenant_id": user.tenant_id,
+                            "acl_tags": list(user.acl_tags),
+                        }
+                    except Exception as exc:
+                        from base.errors import EduRAGError
+                        if isinstance(exc, EduRAGError):
+                            response = JSONResponse(
+                                status_code=exc.http_status,
+                                headers={"WWW-Authenticate": "Bearer"} if exc.http_status == 401 else {},
+                                content={
+                                    "code": exc.http_status,
+                                    "message": exc.message,
+                                    "data": {"error": exc.code},
+                                },
+                            )
+                        else:
+                            raise
+                    else:
+                        response = await call_next(request)
+            # 认证失败/未配置时 response 已生成；认证成功时上面已执行路由。
+        else:
+            response = await call_next(request)
     except Exception as exc:
         log.error("unhandled_error", error=str(exc), exc_info=True)
         response = JSONResponse(

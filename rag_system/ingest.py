@@ -48,6 +48,9 @@ class FileResult:
 
 @dataclass(slots=True)
 class IngestReport:
+    tenant_id: str = ""
+    kb_version: str = ""
+    acl_tags: list[str] = field(default_factory=list)
     files: int = 0
     docs_ok: int = 0
     docs_failed: int = 0
@@ -60,6 +63,9 @@ class IngestReport:
 
     def summary(self) -> dict:
         return {
+            "tenant_id": self.tenant_id,
+            "kb_version": self.kb_version,
+            "acl_tags": list(self.acl_tags),
             "files": self.files,
             "docs_ok": self.docs_ok,
             "docs_failed": self.docs_failed,
@@ -142,9 +148,26 @@ class IngestPipeline:
         limit: int | None = None,
         allow_duplicate: bool = False,
         exclude: tuple[str, ...] = (),
+        tenant_id: str | None = None,
+        kb_version: str | None = None,
+        acl_tags: tuple[str, ...] | list[str] = (),
     ) -> IngestReport:
         started = time.perf_counter()
-        report = IngestReport()
+        tenant_id = (tenant_id if tenant_id is not None else self.settings.tenant_id).strip()
+        kb_version = (kb_version if kb_version is not None else self.settings.kb_version).strip()
+        acl_tags = tuple(dict.fromkeys(str(tag).strip() for tag in acl_tags if str(tag).strip()))
+        if not tenant_id:
+            raise ValueError("tenant_id 不能为空；请通过 --tenant 或 TENANT_ID 指定")
+        if not kb_version:
+            raise ValueError("kb_version 不能为空；请通过 --kb-version 或 KB_VERSION 指定")
+        if len(tenant_id.encode("utf-8")) > 64:
+            raise ValueError("tenant_id UTF-8 字节长度不能超过 64")
+        if len(kb_version.encode("utf-8")) > 32:
+            raise ValueError("kb_version UTF-8 字节长度不能超过 32")
+        if len(acl_tags) > 16 or any(len(tag.encode("utf-8")) > 64 for tag in acl_tags):
+            raise ValueError("ACL 标签最多 16 个，且每个标签 UTF-8 字节长度不能超过 64")
+        report = IngestReport(tenant_id=tenant_id, kb_version=kb_version, acl_tags=list(acl_tags))
+        log.info("ingest_scope", tenant_id=tenant_id, kb_version=kb_version, acl_tags=list(acl_tags))
         if not dry_run:
             self.store.ensure_collection(recreate=recreate)
 
@@ -160,7 +183,17 @@ class IngestPipeline:
                 report.results.append(FileResult(str(path), "failed", error=f"{type(item).__name__}: {item}"))
                 log.warning("ingest_file_failed", path=str(path), error=str(item))
                 continue
-            report.results.append(self._ingest_one(item, report, dry_run=dry_run, allow_duplicate=allow_duplicate))
+            report.results.append(
+                self._ingest_one(
+                    item,
+                    report,
+                    dry_run=dry_run,
+                    allow_duplicate=allow_duplicate,
+                    tenant_id=tenant_id,
+                    kb_version=kb_version,
+                    acl_tags=acl_tags,
+                )
+            )
 
         report.elapsed_ms = int((time.perf_counter() - started) * 1000)
         if not dry_run and self.settings.rag_dedup_enabled:
@@ -179,12 +212,17 @@ class IngestPipeline:
         *,
         dry_run: bool,
         allow_duplicate: bool = False,
+        tenant_id: str,
+        kb_version: str,
+        acl_tags: tuple[str, ...],
     ) -> FileResult:
         t0 = time.perf_counter()
         try:
             # 查重放在切分之前：被拒的文档不该付切分与向量化的代价
             if not allow_duplicate:
-                duplicate = self.dedup.check_and_add(doc.source, doc.text)
+                duplicate = self.dedup.check_and_add(
+                    doc.source, doc.text, scope=f"{tenant_id}\x1f{kb_version}"
+                )
                 if duplicate is not None:
                     report.duplicates += 1
                     reason = f"doc_duplicate: 与 {duplicate.kept_source} 近重复（{duplicate.reason}）"
@@ -213,7 +251,9 @@ class IngestPipeline:
                 report.chunks += len(chunks)
                 return FileResult(doc.source, "ok", len(chunks), len(doc.text), int((time.perf_counter() - t0) * 1000))
 
-            deleted = self.store.delete_by_source(doc.source)
+            deleted = self.store.delete_by_source(
+                doc.source, tenant_id=tenant_id, kb_version=kb_version
+            )
             report.deleted += deleted
             dense, sparse = self.embedder.encode([c.text for c in chunks])
             written = self.store.upsert(
@@ -227,6 +267,9 @@ class IngestPipeline:
                 stage=doc.stage,
                 grade=doc.grade,
                 embedder=self.embedder.name,
+                tenant_id=tenant_id,
+                kb_version=kb_version,
+                acl_tags=acl_tags,
             )
             report.docs_ok += 1
             report.chunks += len(chunks)
@@ -264,6 +307,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="只切分不向量化、不入库")
     p.add_argument("--limit", type=int, default=None, help="只处理前 N 个文件（试探用）")
     p.add_argument("--defaults", action="store_true", help=f"使用 RAG_DOCS_DIR（{s.rag_docs_dir}）")
+    p.add_argument("--tenant", default=None, help=f"租户 ID（默认 TENANT_ID={s.tenant_id}）")
+    p.add_argument("--kb-version", default=None, help=f"知识库版本（默认 KB_VERSION={s.kb_version}）")
+    p.add_argument(
+        "--acl",
+        nargs="*",
+        default=None,
+        help="本批次文档的 ACL 标签；不传或传空表示公共文档，例如 --acl teacher admin",
+    )
     p.add_argument(
         "--allow-duplicate",
         action="store_true",
@@ -301,10 +352,14 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         allow_duplicate=args.allow_duplicate,
         exclude=tuple(args.exclude),
+        tenant_id=args.tenant,
+        kb_version=args.kb_version,
+        acl_tags=tuple(args.acl or ()),
     )
     manifest = pipeline.write_manifest(report)
 
     print("\n==== 入库结果 ====")
+    print(f"租户 {report.tenant_id} / KB {report.kb_version} / ACL {report.acl_tags or ['public']}")
     print(f"文件 {report.files}（成功 {report.docs_ok} / 失败 {report.docs_failed} / 近重复跳过 {report.duplicates}）")
     print(f"子块 {report.chunks}，写入 {report.written}，删除旧块 {report.deleted}")
     print(f"耗时 {report.elapsed_ms} ms" + ("（dry-run，未写库）" if args.dry_run else ""))
