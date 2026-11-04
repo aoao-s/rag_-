@@ -49,6 +49,8 @@ from __future__ import annotations
 
 import re
 
+from understanding.rewrite import has_reference
+
 from base.contracts import (
     IntentProfile,
     QueryContext,
@@ -59,7 +61,6 @@ from base.contracts import (
 )
 
 # 指代词：出现且没有历史上下文时，检索拿原句必然召回不到东西，追问比乱检便宜
-_REFERENTIAL = re.compile(r"(这个|那个|它|其|上面|上述|刚才|前面|该\s*\w|这道|这题|这步)")
 # 并列/对比：拆成多路并行召回，比把整句丢给 embedding 更准
 _MULTI = re.compile(r"(以及|还有|和.+的|对比|比较|区别|分别|各自|差异)")
 _ABSTRACT = re.compile(r"^(什么是|什么叫|为何|为什么说|顾名思义)")
@@ -73,7 +74,8 @@ _HINT_STRATEGIES = frozenset({"direct", "sub_query", "hyde"})
 
 
 def looks_referential(query: str) -> bool:
-    return bool(_REFERENTIAL.search(query or ""))
+    """兼容旧调用方；指代判断统一委托给 understanding.rewrite。"""
+    return has_reference(query)
 
 
 def looks_multi(query: str) -> bool:
@@ -153,7 +155,10 @@ def build_plan(
             note="referential_without_history",
             clarification_reason="referential_without_context",
         )
-    if unresolved_reference:
+    if unresolved_reference and looks_referential(query):
+        # 上游的 unresolved 标记只有在当前问句仍含真正的指代词时才有阻断权。
+        # 这样可以防止旧词表/陈旧标记把「那些物质有哪些」一类独立问句拦在检索前。
+        # 真正的「它是什么」仍然追问，不能把证据门当成指代消解器。
         return _clarify_plan(
             query, filters, ctx, final_n, rerank, "unresolved_reference",
             note="unresolved_reference",

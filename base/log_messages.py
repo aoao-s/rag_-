@@ -50,6 +50,7 @@ MESSAGES: dict[str, str] = {
     # 记录里**不含问句原文**——`q_len` 就够排障，原文受 `LOG_QUERY_TEXT` 管
     "admission_ok": "准入通过 [request_id: {request_id}, 身份: {user_id} ({identity_source}), 角色: {role}, 会话: {session_id}, 学科: {subject}, 问句长度: {q_len}, 降级: {degraded}]",
     "admission_rejected": "准入拒绝 [request_id: {request_id}, 规则: {rule}, 原因: {reason}]",
+    "session_absent": "请求未携带 session_id，已创建新会话（多轮续接需客户端回传）[request_id: {request_id}, 用户: {user_id}, 已创建: {created}]",
     "request_id_rejected": "请求头 X-Request-Id 不合法，已重新生成 [长度: {length}, 原因: {reason}]",
     # 归属写入失败只降级不阻断：本进程的快表仍然记着（`ChatPipeline.claim_session`），
     # 重启后这条会话会回到"未认领"，那是可接受的——比让人问不了问题好
@@ -145,7 +146,7 @@ MESSAGES: dict[str, str] = {
     "understanding_ready": "理解完成 [request_id: {request_id}, 成功: {success}, 意图: {intent}({intent_method}), 置信: {confidence}, 档位: {profile}, 复合: {is_complex}({sub_queries} 路), 追问: {is_follow_up}]",
     # 指代没解开（任务 2.4）。这是"降级但照常检索"的一条：代词原样进了检索问句，
     # 答案可能跑偏，但**不猜主语**——编一个没出现过的限定词去收窄检索才是真故障
-    "coreference_unresolved": "指代未解开，按原问句检索 [request_id: {request_id}, 历史: {history_turns} 轮, 改写方式: {rewrite_method}]",
+    "coreference_unresolved": "指代未解开，保留原问句并交由 Planner 判断是否追问 [request_id: {request_id}, 历史: {history_turns} 轮, 改写方式: {rewrite_method}]",
     # 复合问句拆分（任务 2.4，2026-11-01 改由本地小模型拆）。`source` 一格说清"这次是谁拆的"：
     # `model` 是本地小模型、其余是规则各分支——排障时先看这一格，就不用去猜模型到底有没有被调到
     "compound_split": "复合问句拆分 [request_id: {request_id}, 来源: {source}, 子问题: {sub_queries} 路, 丢弃: {dropped}, 耗时: {latency_ms}ms]",
@@ -278,7 +279,7 @@ DEGRADED_LABELS: dict[str, str] = {
     "backtrack_without_history": "问题含指代但没有上下文，已改为追问",
     # 指代未解开（任务 2.4）。与上一条的区别：上面是"没有历史，改成追问"，
     # 这条是"有历史但改写没落地，代词原样拿去检索了"——结论不同，处置也不同
-    "coreference_unresolved": "问题含指代但未能改写，已按原问句检索",
+    "coreference_unresolved": "问题含指代但未能改写，保留原问句并由 Planner 按上下文风险决策",
     # 复合问句拆分（任务 2.4）。四条都是"**这次是规则拆的**"——结果照样能用，
     # 所以它们不会把 `status` 推到 degraded（见 `state._DEGRADED_ANSWER` 刻意不含它们）。
     # 分开记是因为处置不同：超时该调预算，格式不符该改提示词，被拒说明模型在编词

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -71,6 +72,21 @@ def search_partitions(
         return picked or None
     picked = [p for p in known if p not in EXCLUDED_BY_DEFAULT]
     return picked or None
+
+
+def _scope_prefix(tenant_id: str, kb_version: str) -> str:
+    """同一路径/正文可存在于不同租户或 KB 版本，主键必须带隔离命名空间。"""
+    raw = f"{tenant_id}\0{kb_version}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _required_security_value(value: str, field: str, max_bytes: int) -> str:
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError(f"{field} 不能为空，拒绝写入默认权限元数据")
+    if len(value.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{field} UTF-8 字节长度不能超过 {max_bytes}")
+    return value
 
 
 def _clip(text: str, max_bytes: int) -> str:
@@ -279,22 +295,33 @@ class ChunkStore:
         embedder: str,
         stage: str | None = None,
         grade: str | None = None,
-        tenant_id: str = "default",
-        kb_version: str = "v1",
+        tenant_id: str,
+        kb_version: str,
         acl_tags: Sequence[str] = (),
         batch_size: int = 64,
     ) -> int:
+        tenant_id = _required_security_value(tenant_id, "tenant_id", 64)
+        kb_version = _required_security_value(kb_version, "kb_version", 32)
+        tags = list(dict.fromkeys(str(tag).strip() for tag in acl_tags))
+        if any(not tag for tag in tags):
+            raise ValueError("acl_tags 不允许包含空标签")
+        if len(tags) > _ACL_CAPACITY:
+            raise ValueError(f"acl_tags 最多允许 {_ACL_CAPACITY} 个标签")
+        if any(len(tag.encode("utf-8")) > 64 for tag in tags):
+            raise ValueError("ACL 标签 UTF-8 字节长度不能超过 64")
         if not chunks:
             return 0
         ts = int(time.time())
-        tags = [_clip(t, 64) for t in list(dict.fromkeys(acl_tags))[:_ACL_CAPACITY]]
+        scope = _scope_prefix(tenant_id, kb_version)
         rows: list[dict[str, Any]] = []
         for chunk, dv, sv in zip(chunks, dense, sparse):
             rows.append(
                 {
-                    "chunk_id": _clip(chunk.chunk_id, 160),
-                    "doc_id": _clip(chunk.doc_id, 64),
-                    "parent_id": _clip(chunk.parent_id, 160),
+                    # Milvus 的 chunk_id 是全集合主键。同一 source 被两个租户入库时，
+                    # 原始 splitter ID 完全相同，后写会覆盖先写。租户 + KB 版本必须进入 ID。
+                    "chunk_id": _clip(f"{scope}:{chunk.chunk_id}", 160),
+                    "doc_id": _clip(f"{scope}:{chunk.doc_id}", 64),
+                    "parent_id": _clip(f"{scope}:{chunk.parent_id}", 160),
                     "text": _clip(chunk.text, _F_TEXT),
                     "parent_text": _clip(chunk.parent_text, _F_PARENT),
                     "source": _clip(source, 512),
@@ -308,8 +335,8 @@ class ChunkStore:
                     "chunk_index": chunk.index,
                     "ts": ts,
                     "embedder": _clip(embedder, 32),
-                    "tenant_id": _clip(tenant_id or "default", 64),
-                    "kb_version": _clip(kb_version or "v1", 32),
+                    "tenant_id": tenant_id,
+                    "kb_version": kb_version,
                     "acl_tags": tags,
                     "dense": dv,
                     "sparse": sv,
@@ -327,17 +354,33 @@ class ChunkStore:
             written += len(batch)
         return written
 
-    def delete_by_source(self, source: str) -> int:
-        """删除同一文件的历史块：入库幂等的关键一步。"""
-        expr = f'source == "{_escape(source)}"'
+    def delete_by_source(self, source: str, *, tenant_id: str, kb_version: str) -> int:
+        """只删除当前租户、当前 KB 版本中同一路径的历史块。"""
+        tenant_id = _required_security_value(tenant_id, "tenant_id", 64)
+        kb_version = _required_security_value(kb_version, "kb_version", 32)
+        expr = (
+            f'source == "{_escape(source)}" and '
+            f'tenant_id == "{_escape(tenant_id)}" and '
+            f'kb_version == "{_escape(kb_version)}"'
+        )
         res = self._client.delete(collection_name=self.collection, filter=expr)
         count = int(res.get("delete_count", 0)) if isinstance(res, dict) else 0
         if count:
-            log.info("milvus_deleted_by_source", source=source, count=count)
+            log.info(
+                "milvus_deleted_by_source",
+                source=source,
+                tenant_id=tenant_id,
+                kb_version=kb_version,
+                count=count,
+            )
         return count
 
-    def delete_by_doc(self, doc_id: str) -> int:
-        expr = f'doc_id == "{_escape(doc_id)}"'
+    def delete_by_doc(self, doc_id: str, *, tenant_id: str, kb_version: str) -> int:
+        """按隔离命名空间删除文档，避免跨租户 doc_id 碰撞。"""
+        tenant_id = _required_security_value(tenant_id, "tenant_id", 64)
+        kb_version = _required_security_value(kb_version, "kb_version", 32)
+        scoped_doc_id = f"{_scope_prefix(tenant_id, kb_version)}:{doc_id}"
+        expr = f'doc_id == "{_escape(scoped_doc_id)}"'
         res = self._client.delete(collection_name=self.collection, filter=expr)
         return int(res.get("delete_count", 0)) if isinstance(res, dict) else 0
 
@@ -437,8 +480,7 @@ class ChunkStore:
                 # 无标签的公共文档对所有租户可见；有标签的必须命中其一。
                 conds.append(f"(array_length(acl_tags) == 0 or array_contains_any(acl_tags, [{tags}]))")
             else:
-                # 用户没有任何 ACL 标签时，只能读公共文档。
-                # 不能省略 ACL 条件，否则会把所有带权限标签的私有文档也召回。
+                # 没有 ACL 标签的用户只能读公共文档，不能省略权限过滤。
                 conds.append("array_length(acl_tags) == 0")
             if len(filters.subjects) == 1:
                 conds.append(f'subject == "{_escape(filters.subjects[0])}"')

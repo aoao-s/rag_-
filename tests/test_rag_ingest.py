@@ -17,7 +17,7 @@ from rag_system.ingest import IngestPipeline, IngestReport
 
 class FakeStore:
     def __init__(self) -> None:
-        self.deleted: list[str] = []
+        self.deleted: list[dict] = []
         self.upserted: list[dict] = []
         self.ensured = 0
         self.content: dict[str, list[str]] = {}
@@ -27,8 +27,8 @@ class FakeStore:
         if recreate:
             self.content.clear()
 
-    def delete_by_source(self, source: str) -> int:
-        self.deleted.append(source)
+    def delete_by_source(self, source: str, *, tenant_id: str, kb_version: str) -> int:
+        self.deleted.append({"source": source, "tenant_id": tenant_id, "kb_version": kb_version})
         return len(self.content.pop(source, []))
 
     def upsert(self, chunks, dense, sparse, **meta) -> int:
@@ -97,7 +97,10 @@ def test_run_writes_chunks_and_isolates_failure(tmp_path: Path) -> None:
     assert report.docs_failed == 1
     assert report.chunks > 0
     assert report.written == report.chunks
-    assert store.deleted == ["F:/x/数学-a.md"]
+    assert store.deleted == [{"source": "F:/x/数学-a.md", "tenant_id": "default", "kb_version": "v1"}]
+    assert store.upserted[0]["meta"]["tenant_id"] == "default"
+    assert store.upserted[0]["meta"]["kb_version"] == "v1"
+    assert store.upserted[0]["meta"]["acl_tags"] == ()
     assert report.results[0].status == "ok"
 
 
@@ -106,7 +109,10 @@ def test_rerun_deletes_old_chunks(tmp_path: Path) -> None:
     pipe.run([tmp_path])
     pipe.run([tmp_path])
     # 两次入库各删一次，证明是"先删后写"而不是叠加
-    assert store.deleted == ["F:/x/数学-a.md", "F:/x/数学-a.md"]
+    assert store.deleted == [
+        {"source": "F:/x/数学-a.md", "tenant_id": "default", "kb_version": "v1"},
+        {"source": "F:/x/数学-a.md", "tenant_id": "default", "kb_version": "v1"},
+    ]
     assert len(store.upserted) == 2
 
 
@@ -140,3 +146,55 @@ def test_empty_doc_skipped(tmp_path: Path) -> None:
     assert report.written == 0
     assert store.upserted == []
     assert report.results[0].status == "skipped"
+
+
+def test_run_propagates_explicit_tenant_version_and_acl(tmp_path: Path) -> None:
+    pipe, store = _pipeline(tmp_path, [_doc("F:/x/数学-private.md")])
+    report = pipe.run(
+        [tmp_path],
+        tenant_id="school_a",
+        kb_version="edurag_v2",
+        acl_tags=("teacher", "admin"),
+    )
+
+    assert report.tenant_id == "school_a"
+    assert report.kb_version == "edurag_v2"
+    assert report.acl_tags == ["teacher", "admin"]
+    assert store.deleted[0] == {
+        "source": "F:/x/数学-private.md",
+        "tenant_id": "school_a",
+        "kb_version": "edurag_v2",
+    }
+    meta = store.upserted[0]["meta"]
+    assert meta["tenant_id"] == "school_a"
+    assert meta["kb_version"] == "edurag_v2"
+    assert meta["acl_tags"] == ("teacher", "admin")
+
+
+def test_run_rejects_empty_security_scope(tmp_path: Path) -> None:
+    pipe, _ = _pipeline(tmp_path, [_doc("F:/x/数学-a.md")])
+    import pytest
+
+    with pytest.raises(ValueError, match="tenant_id 不能为空"):
+        pipe.run([tmp_path], tenant_id=" ")
+
+
+def test_cli_accepts_security_metadata() -> None:
+    from rag_system.ingest import _parse_args
+
+    args = _parse_args(["--tenant", "school_a", "--kb-version", "v2", "--acl", "teacher", "admin"])
+    assert args.tenant == "school_a"
+    assert args.kb_version == "v2"
+    assert args.acl == ["teacher", "admin"]
+
+
+def test_same_source_can_be_ingested_for_two_tenants(tmp_path: Path) -> None:
+    pipe, store = _pipeline(tmp_path, [_doc("F:/shared/数学.pdf")])
+
+    first = pipe.run([tmp_path], tenant_id="school_a", kb_version="v1")
+    second = pipe.run([tmp_path], tenant_id="school_b", kb_version="v1")
+
+    assert first.docs_ok == 1 and first.duplicates == 0
+    assert second.docs_ok == 1 and second.duplicates == 0
+    assert len(store.upserted) == 2
+    assert [item["meta"]["tenant_id"] for item in store.upserted] == ["school_a", "school_b"]

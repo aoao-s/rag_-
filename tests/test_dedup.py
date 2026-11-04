@@ -170,7 +170,7 @@ class _Store:
     def ensure_collection(self, *, recreate: bool = False) -> None:
         return None
 
-    def delete_by_source(self, source: str) -> int:
+    def delete_by_source(self, source: str, *, tenant_id: str, kb_version: str) -> int:
         return 0
 
     def upsert(self, chunks, dense, sparse, **meta) -> int:
@@ -255,3 +255,28 @@ def test_fingerprints_persist_across_runs(tmp_path: Path) -> None:
     second, store = _pipeline(tmp_path, [_doc("F:/d/人教版数学九年级上册.pdf", BOOK)])
     report = second.run([tmp_path])
     assert report.duplicates == 1 and store.upserted == []
+
+
+def test_same_source_can_be_ingested_in_different_tenant_and_version_scopes() -> None:
+    index = DedupIndex()
+    source = "F:/datasets/初中/数学/教材.pdf"
+    assert index.check_and_add(source, BOOK, scope="school_a\x1fv1") is None
+    # 同一物理文件可以被另一个租户、另一个 KB 版本分别索引。
+    assert index.check_and_add(source, BOOK, scope="school_b\x1fv1") is None
+    assert index.check_and_add(source, BOOK, scope="school_a\x1fv2") is None
+    # 同一个 scope 内仍然能拦住不同路径的重复文档。
+    duplicate = index.check_and_add("F:/datasets/初中/数学/教材-副本.pdf", BOOK, scope="school_a\x1fv1")
+    assert duplicate is not None
+
+
+def test_fingerprint_roundtrip_preserves_scope(tmp_path: Path) -> None:
+    path = tmp_path / "scoped-fp.json"
+    first = DedupIndex()
+    source = "F:/datasets/初中/数学/教材.pdf"
+    first.check_and_add(source, BOOK, scope="school_a\x1fv2")
+    first.save(path)
+
+    second = DedupIndex()
+    second.load(path)
+    assert second.check_and_add(source, BOOK, scope="school_a\x1fv2") is None
+    assert second.check_and_add(source, BOOK, scope="school_b\x1fv2") is None

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from understanding.rewrite import needs_rewrite, rewrite
+from understanding.rewrite import has_reference, needs_rewrite, rewrite
 
 
 @dataclass(frozen=True)
@@ -73,3 +73,16 @@ def test_rewritten_query_is_capped() -> None:
     long_q = "勾股定理" * 40
     text, method = rewrite("它的证明呢", _history(("user", long_q)))
     assert method == "rule" and len(text) <= 120
+
+
+def test_demonstrative_plural_words_are_not_unresolved_references() -> None:
+    """「这些/那些」可以独立指称一类事物，不应触发指代故障或借用历史。"""
+    assert has_reference("那些物质能产生蓝色沉淀？") is False
+    assert has_reference("这些学生如何分组？") is False
+    assert has_reference("哪些物质能产生蓝色沉淀？") is False
+    assert has_reference("它能产生蓝色沉淀吗？") is True
+
+    history = _history(("user", "化学里面有哪些常见沉淀反应？"))
+    query = "化学里面能产生蓝色沉淀的都有那些？"
+    assert needs_rewrite(query) is False
+    assert rewrite(query, history) == (query, "none")

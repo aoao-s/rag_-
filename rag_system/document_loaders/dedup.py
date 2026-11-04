@@ -118,16 +118,17 @@ class DedupIndex:
         self.distance = distance
         self.prefix_chars = prefix_chars
         self.min_chars = min_chars
-        self._by_name: dict[str, str] = {}
-        self._prints: list[tuple[str, int]] = []
+        # 查重范围必须与知识库隔离范围一致：同一路径可以分别进入不同租户、不同版本。
+        # 旧指纹文件没有 scope 字段时，按 default:v1 兼容，避免默认库重跑时突然漏拦。
+        self._by_name: dict[tuple[str, str], str] = {}
+        self._prints: list[tuple[str, str, int]] = []
 
     # ---- 查询与登记 ----
-    def check(self, source: str, text: str) -> Duplicate | None:
-        """查重。**自己不算重复**：同一篇文档更新后重跑入库，指纹会变，
-        不排掉自己就会在第二次入库时被第一次留下的记录挡住。"""
+    def check(self, source: str, text: str, *, scope: str = "default:v1") -> Duplicate | None:
+        """在指定隔离范围内查重。**自己不算重复**，不同租户/版本互不挡路。"""
         if not self.enabled:
             return None
-        key = normalize_name(source)
+        key = (scope, normalize_name(source))
         kept = self._by_name.get(key)
         if kept is not None and kept != source:
             return Duplicate(kept_source=kept, reason="name")
@@ -137,29 +138,32 @@ class DedupIndex:
             return None  # 太短，simhash 不稳定，宁可放过
         fingerprint = simhash(body)
         best: Duplicate | None = None
-        for kept_source, kept_print in self._prints:
-            if kept_source == source:
+        for kept_scope, kept_source, kept_print in self._prints:
+            if kept_scope != scope or kept_source == source:
                 continue
             dist = hamming(fingerprint, kept_print)
             if dist <= self.distance and (best is None or dist < best.distance):
                 best = Duplicate(kept_source=kept_source, reason="simhash", distance=dist)
         return best
 
-    def add(self, source: str, text: str) -> None:
-        """登记。同一 `source` 重新登记时覆盖旧记录（内容改过，指纹要跟着换）。"""
+    def add(self, source: str, text: str, *, scope: str = "default:v1") -> None:
+        """登记。同一隔离范围内的同一 source 重跑时覆盖旧指纹。"""
         if not self.enabled:
             return
-        key = normalize_name(source)
+        key = (scope, normalize_name(source))
         self._by_name[key] = source
-        self._prints = [(s, p) for s, p in self._prints if s != source]
+        self._prints = [
+            (sco, src, fp) for sco, src, fp in self._prints
+            if not (sco == scope and src == source)
+        ]
         body = (text or "")[: self.prefix_chars]
         if len(body) >= self.min_chars:
-            self._prints.append((source, simhash(body)))
+            self._prints.append((scope, source, simhash(body)))
 
-    def check_and_add(self, source: str, text: str) -> Duplicate | None:
-        hit = self.check(source, text)
+    def check_and_add(self, source: str, text: str, *, scope: str = "default:v1") -> Duplicate | None:
+        hit = self.check(source, text, scope=scope)
         if hit is None:
-            self.add(source, text)
+            self.add(source, text, scope=scope)
         return hit
 
     def __len__(self) -> int:
@@ -177,18 +181,25 @@ class DedupIndex:
             source = str(item.get("source", ""))
             if not source:
                 continue
-            self._by_name[normalize_name(source)] = source
+            # 旧格式没有 scope，归属历史默认知识库，不能把它扩散到其他租户。
+            scope = str(item.get("scope") or "default:v1")
+            self._by_name[(scope, normalize_name(source))] = source
             fingerprint = item.get("simhash")
             if isinstance(fingerprint, int):
-                self._prints.append((source, fingerprint))
+                self._prints.append((scope, source, fingerprint))
         return len(self._by_name)
 
     def save(self, path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "docs": [
-                {"source": source, "name": normalize_name(source), "simhash": fingerprint}
-                for source, fingerprint in self._prints
+                {
+                    "scope": scope,
+                    "source": source,
+                    "name": normalize_name(source),
+                    "simhash": fingerprint,
+                }
+                for scope, source, fingerprint in self._prints
             ]
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

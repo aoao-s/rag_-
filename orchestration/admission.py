@@ -599,7 +599,16 @@ async def _resolve_session(
     if sid is None:
         if not identity.user_id:
             # 匿名不签发会话：没有归属的会话写进库就再也删不掉（§7.9 边界 3）。
+            log.info(
+                "session_absent", request_id=request_id, user_id="-", created=False
+            )
             return None, ()
+        # 首轮请求由服务端签发新 sid。客户端若不保存并在下一轮回传，
+        # 下一次请求就会得到另一个 sid，历史自然无法续接；这里明确留痕。
+        log.info(
+            "session_absent", request_id=request_id,
+            user_id=identity.user_id, created=True,
+        )
         return uuid.uuid4().hex, ()
 
     if not _SESSION_RE.match(sid):

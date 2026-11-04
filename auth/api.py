@@ -80,11 +80,6 @@ class RegisterBody(_Body):
     username: str = Field(min_length=1, max_length=64, description="3–64 位，字母数字与 _ . @ -")
     password: str = Field(min_length=1, max_length=128, description="至少 8 位")
     nickname: str = Field(default="", max_length=64, description="显示名；中文放这里，不放 username")
-    role: str | None = Field(
-        default=None,
-        max_length=16,
-        description="声明的角色：STUDENT / TEACHER；不传即 STUDENT。ADMIN 不可自助注册",
-    )
     captcha: str | None = Field(default=None, max_length=32, description="预留：本版本不校验")
 
 
@@ -254,7 +249,6 @@ def _bearer(request: Request) -> str:
     "username": "student001",
     "password": "your_password",
     "nickname": "小明",
-    "role": "STUDENT",
 })})
 async def register(request: Request) -> JSONResponse:
     """注册并直接登录。
@@ -276,8 +270,10 @@ async def register(request: Request) -> JSONResponse:
 
     async def impl() -> JSONResponse:
         body = await _read(request, RegisterBody)
+        # 公共注册入口只能创建 STUDENT。TEACHER / ADMIN 由管理员审核后在用户表授予，
+        # 防止任何人把注册请求里的 role 改成 TEACHER 来获得教案/备课权限。
         session = await _service(request).register(
-            body.username, body.password, nickname=body.nickname, role=body.role
+            body.username, body.password, nickname=body.nickname
         )
         return _ok("注册成功", _session_data(session))
 
